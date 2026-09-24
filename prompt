@@ -1,0 +1,78 @@
+# Build: Dividend Projection Calendar
+
+## Context
+There's a working mockup at `/Users/islootski/Downloads/dividend-projection-calendar.html`.
+It's a single self-contained HTML+JS file with placeholder data that demonstrates the
+exact behavior I want. Read it first — it is the source of truth for layout, colors,
+and interactions. Your job is to turn it into the real thing wired to my actual data,
+preserving all the behavior below.
+
+## Data source
+- Pull dividend data from my Interactive Brokers account via Flex Query
+  (dividend / cash-transaction records). Group by symbol and by month.
+- Rows = every ticker currently held in the account (the mockup uses
+  HAFN/PFE/XOM/KO/MSTY/CONY as placeholders — replace with the real holdings).
+- For each dividend event I need: ticker, declaration date, payment date,
+  amount, and current status (paid / declared / projected).
+- Note: IBKR may report amounts gross with withholding tax separate. Tell me which
+  direction the real numbers arrive in (gross vs net) and store accordingly — see Tax below.
+
+## Layout
+- Table: rows = tickers, columns = months in chronological order, labeled "Mon YYYY"
+  (e.g. "May 2026").
+- Highlight/bold the CURRENT month column header so it stands out.
+- A "Total" row at the bottom = sum of the amounts displayed in each month column.
+
+## Per-ticker forward horizon (independent per row)
+- Project each ticker forward ONLY up to its next payment month (the payment tied to
+  its next declaration). Show nothing beyond that for that ticker.
+- Example: HAFN declares Dec 2026 but pays Jan 2027 → HAFN's row extends through
+  Jan 2027 and no later.
+- If a ticker declares and pays in the same month, that single month is its final cell.
+
+## Cell states + color coding (color = STATUS, not value)
+- PAST months: paid amounts only (GREEN). Never show a declared/projected amount in a
+  past month — history is paid or empty.
+- GREEN  = paid (show amount).
+- YELLOW = declared but not yet paid (show amount). Place this in the PAYMENT month,
+  forward-only — never in the past.
+- RED word "Declare" = upcoming declaration month, not yet declared.
+- RED word "Pay"     = upcoming payment month, amount not yet known (not declared).
+- Same-month declare+pay that hasn't happened yet → single RED "Declare" cell.
+
+## Tooltips (hover)
+- Hover "Declare" → `declaration: DD-MM-YYYY`
+- Hover "Pay"     → `pay: DD-MM-YYYY`
+- Hover a YELLOW declared amount → `declaration: DD-MM-YYYY`
+- Same-month declare+pay → show BOTH on two lines:
+      declaration: 17-06-2026
+      pay: 20-06-2026
+- Dates formatted dd-mm-yyyy.
+
+## Tax toggle
+- Tax rate 25% (make it a constant, easy to change).
+- A toggle: "After tax" (net) vs "Before tax" (gross).
+- Switching it recomputes every displayed value at once: cell amounts, the monthly
+  Total row, and the trailing paid-sum. Update a caption to say which view is active.
+
+## Lookback selector + trailing paid-sum
+- A selector with 3M / 6M / 1Y.
+- It controls how much HISTORY the table shows (always keep the forward projection
+  out to each ticker's horizon, regardless of lookback).
+- It also recomputes a headline figure: the SUM OF PAID dividends only (GREEN only —
+  exclude declared/yellow and pending words), over the trailing window ending at and
+  INCLUDING the current month.
+- Lookback and tax-mode are independent state: changing one keeps the other.
+
+## Implementation notes
+- Keep it data-driven: a single data array of events
+  `{ month, amount, status, declDate, payDate }` that the table renders from, so
+  swapping placeholder data for live IBKR data only touches the data layer.
+- Single self-contained file is fine, or split sensibly if you prefer.
+- Quick decisions baked into the mockup that you should keep unless they conflict with
+  the real data: declared amount counted in the payment month; trailing window inclusive
+  of the current month; paid-sum strictly green.
+
+## Deliverable
+Update the file in place (or a clear new version) and tell me what IBKR Flex Query
+fields/columns you need me to enable so you can populate the real data.

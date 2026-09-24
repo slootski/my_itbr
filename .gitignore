@@ -1,0 +1,23 @@
+# Secrets
+.env
+
+# Local DB snapshots (and its rotating backups)
+db/*.sqlite
+db/*.sqlite3
+db/backups/
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Runtime logs
+logs/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store

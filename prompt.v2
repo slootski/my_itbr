@@ -1,0 +1,121 @@
+# Build: Dividend Projection Calendar (v2)
+
+## Context
+There's a working mockup at `/Users/islootski/Downloads/dividend-projection-calendar.html`.
+It's a single self-contained HTML+JS file with placeholder data that demonstrates the
+exact behavior I want. Read it first — it is the source of truth for layout, colors,
+and interactions. Your job is to turn it into the real thing wired to my actual data,
+preserving all the behavior below.
+
+## Data sources — strict priority
+1. **Interactive Brokers (Flex Query) is ground truth.** Always use it first.
+   - Paid dividends: `CashTransactions` section, types `DIVIDEND`, `PAYMENTINLIEU`,
+     and `WHTAX` (withholding tax, negative). Fields: `symbol`, `amount`, `currency`,
+     `fxRateToBase`, `dateTime`, `settleDate`, `reportDate`, `exDate`,
+     `transactionID`, `actionID`.
+   - Declared-but-unpaid dividends: `OpenDividendAccruals` section. Fields: `symbol`,
+     `exDate`, `payDate`, `grossRate`, `grossAmount`, `netAmount`, `tax`, `quantity`,
+     `issuerCountryCode`.
+   - Held tickers: `OpenPositions` section (`symbol`, `quantity`).
+2. **External sources only fill gaps IBKR leaves.** They never replace an IBKR cell.
+   - Polygon (`POLYGON_API_KEY`): real declared per-share amount x shares held, only
+     for held tickers with no IBKR open accrual.
+   - yfinance: dates only, never amounts, only for held tickers with no IBKR data at all.
+3. Every cell that did not come from IBKR names its source in the tooltip
+   (`source: polygon` / `source: yfinance`).
+4. **Conflicts:** when an external source and IBKR describe the same dividend event
+   (same symbol + ex-date) with different amounts or dates, show the IBKR value and
+   log a warning with both values. Never show the external value.
+5. Flex history rolls off after 365 days — archive cash transactions locally (SQLite)
+   and build paid history from the archive.
+
+## Layout
+- Table: rows = every ticker currently held, columns = months in chronological order,
+  labeled "Mon YYYY" (e.g. "May 2026").
+- Highlight/bold the CURRENT month column header so it stands out.
+- A "Total" row at the bottom = sum of the amounts displayed in each month column.
+- Held tickers with no dividend data from any source: greyed placeholder row.
+
+## Per-ticker forward horizon (independent per row)
+- Project each ticker forward ONLY up to its next payment month (the payment tied to
+  its next declaration). Show nothing beyond that for that ticker.
+- Example: HAFN declares Dec 2026 but pays Jan 2027 → HAFN's row extends through
+  Jan 2027 and no later.
+- If a ticker declares and pays in the same month, that single month is its final cell.
+- Weekly payers (e.g. CONY, MSTY): project from the real day-level gap between
+  payments, not from whole-month cadence.
+
+## Cell states + color coding (color = STATUS, not value)
+- PAST months: paid amounts only (GREEN). Never show a declared/projected amount in a
+  past month — history is paid or empty.
+- GREEN  = paid (show amount). Source: IBKR only.
+- YELLOW = declared but not yet paid (show amount). Place this in the PAYMENT month,
+  forward-only — never in the past. Source: IBKR accrual, else Polygon.
+- RED word "Declare" = upcoming declaration month, not yet declared.
+- RED word "Pay"     = upcoming payment month, amount not yet known (not declared).
+- Same-month declare+pay that hasn't happened yet → single RED "Declare" cell.
+- Red cells are estimates from each ticker's payment history. The tooltip must mark
+  estimated dates with "~" and "(estimated)".
+
+## Tooltips (hover)
+- Hover "Declare" → `declaration: DD-MM-YYYY`
+- Hover "Pay"     → `pay: DD-MM-YYYY`
+- Hover a YELLOW declared amount → `declaration: DD-MM-YYYY`
+- Same-month declare+pay → show BOTH on two lines:
+      declaration: 17-06-2026
+      pay: 20-06-2026
+- Dates formatted dd-mm-yyyy.
+- Add `source: ...` when the cell is not from IBKR.
+- No per-cell or per-row tax markers — the page-level tax toggle is the only tax UI.
+
+## Tax toggle
+- A toggle: "After tax" (net) vs "Before tax" (gross).
+- **IBKR amounts use the real per-ticker tax, never a flat rate:**
+  - Paid: gross = DIVIDEND + PAYMENTINLIEU; net = gross + matching WHTAX rows (match
+    by symbol + ex-date, because IBKR can post the tax in a different month).
+  - Declared: use the accrual's `grossAmount` / `netAmount`.
+- **When IBKR withholds nothing, apply `DEFAULT_TAX_RATE = 0.25`** (a constant, easy
+  to change). Example: HAFN (Singapore, `issuerCountryCode="SG"`) has no WHTAX rows and
+  accrual `tax=0`. Before tax shows the full amount (11.01); after tax shows
+  11.01 x 0.75 = 8.26. After-tax mode must never show an untaxed gross figure.
+- **External amounts (Polygon) are gross.** Net is an estimate, marked with "≈":
+  1. use the ticker's historical IBKR net/gross ratio when that history shows real
+     withholding;
+  2. else apply `DEFAULT_TAX_RATE`.
+- Switching the toggle recomputes every displayed value at once: cell amounts, the
+  monthly Total row, and the trailing paid-sum. Update a caption to say which view
+  is active.
+
+## Lookback selector + trailing paid-sum
+- A selector with 3M / 6M / 1Y.
+- It controls how much HISTORY the table shows (always keep the forward projection
+  out to each ticker's horizon, regardless of lookback).
+- It also recomputes a headline figure: the SUM OF PAID dividends only (GREEN only —
+  exclude declared/yellow and pending words), over the trailing window ending at and
+  INCLUDING the current month.
+- Lookback and tax-mode are independent state: changing one keeps the other.
+
+## Implementation notes
+- Keep it data-driven: a single data array of events
+  `{ month, amount_gross, amount_net, status, declDate, payDate, source }`
+  that the table renders from, so swapping data sources only touches the data layer.
+- Quick decisions to keep unless they conflict with the real data: declared amount
+  counted in the payment month; trailing window inclusive of the current month;
+  paid-sum strictly green.
+- The page caption must describe all sources actually used (IBKR, Polygon, yfinance).
+
+## Tests (required)
+- A ticker with no WHTAX rows and accrual `tax=0` shows the full amount before tax
+  and 25% less after tax (paid cells, declared cells, totals, and paid-sum).
+- A ticker with WHTAX rows shows net < gross in after-tax mode.
+- An external (Polygon/yfinance) entry never replaces a paid or declared IBKR cell.
+- When Polygon and IBKR disagree on the same event, the IBKR value is shown and a
+  warning is logged.
+- A Polygon amount for a ticker with no paid history uses the 25% default in
+  after-tax mode and is marked "≈".
+- A WHTAX row posted in a different month than its dividend is folded into the
+  dividend's month.
+
+## Deliverable
+Update the code in place, run the tests, and report: what changed, which cells come
+from which source for my current holdings, and any IBKR-vs-external conflicts found.
