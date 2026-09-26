@@ -340,6 +340,9 @@ def test_lookback_clips_history_and_scopes_paid_sum():
                                         today=dt.date(2026, 6, 20))
     assert cal_full.values.columns[0] == "2026-01"  # no lookback -> full history
     assert cal_full.paid_sum == 60.0
+    # Per-ticker Total column follows the same window as paid_sum.
+    assert cal.ticker_totals["ABC"] == "30.00"
+    assert cal_full.ticker_totals["ABC"] == "60.00"
 
 
 def test_paid_sum_excludes_declared():
@@ -356,6 +359,9 @@ def test_paid_sum_excludes_declared():
     cal = dividends.build_calendar(_positions("ABC"), cash_tx, accruals,
                                    today=dt.date(2026, 6, 1), lookback_months=6)
     assert cal.paid_sum == 100.0
+    assert cal.ticker_totals["ABC"] == "100.00"  # declared 30/40 not added
+    assert cal.totals["2026-06"] == ""           # declared month: nothing paid yet
+    assert cal.declared_sum == 40.0              # shown separately, gross basis
 
 
 def test_current_month_column_always_present():
@@ -524,7 +530,7 @@ def test_external_declared_amount_renders_yellow_with_cash():
     tip = cal.tooltips.at["COPX", "2026-07"]
     assert "polygon" in tip and "20-01-2026" in tip
     # Declared amounts feed the month total.
-    assert cal.totals["2026-07"] == "25.80"
+    assert cal.totals["2026-07"] == ""  # declared, unpaid -> not summed
     assert "COPX" not in cal.no_data
 
 
@@ -541,7 +547,7 @@ def test_polygon_declared_overrides_projection_before_tax():
     # The real declaration suppresses BOTH projected red cells.
     assert "declare" not in cal.status.values
     assert "pay" not in cal.status.values
-    assert cal.totals["2026-06"] == "50.00"
+    assert cal.totals["2026-06"] == ""  # declared, unpaid -> not summed
 
 
 def test_polygon_declared_estimates_net_after_tax():
@@ -566,7 +572,7 @@ def test_polygon_declared_estimates_net_after_tax():
     tip = cal.tooltips.at["ABC", "2026-06"]
     assert "15-04-2026" in tip
     assert "estimated" in tip and "25%" in tip
-    assert cal.totals["2026-06"] == "37.50"                # estimate feeds totals
+    assert cal.totals["2026-06"] == ""                     # unpaid estimate never summed
     assert "pay" not in cal.status.values                  # projection still gone
 
 
@@ -629,7 +635,7 @@ def test_zero_withholding_accrual_uses_default_rate_after_tax():
                                    today=dt.date(2026, 9, 14), net=True)
     assert gross.values.at["HAFN", "2026-09"] == "11.01"
     assert net.values.at["HAFN", "2026-09"] == "8.26"
-    assert net.totals["2026-09"] == "8.26"
+    assert net.totals["2026-09"] == ""  # declared, unpaid -> not summed
 
 
 def test_net_ratio_by_symbol():

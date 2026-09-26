@@ -80,11 +80,12 @@ def _section(html_doc: str, tag: str) -> str:
 
 
 def test_d1_month_headers_are_mon_yyyy():
-    html_doc = app._calendar_html(_composite_calendar())
+    html_doc = app._calendar_html(_composite_calendar(), dark=False)
     head = _section(html_doc, "thead")
     labels = re.findall(r"<th[^>]*>([^<]*)</th>", head)
     assert labels[0] == "Ticker"
-    month_labels = labels[1:]
+    assert labels[1] == "Total"  # per-ticker paid sum, right next to the ticker
+    month_labels = labels[2:]
     assert month_labels, "no month columns rendered"
     for lbl in month_labels:
         assert re.fullmatch(r"[A-Z][a-z]{2} \d{4}", lbl), f"bad month label: {lbl!r}"
@@ -94,7 +95,7 @@ def test_d1_month_headers_are_mon_yyyy():
 
 
 def test_d2_current_month_header_highlighted_exactly_once():
-    html_doc = app._calendar_html(_composite_calendar())
+    html_doc = app._calendar_html(_composite_calendar(), dark=False)
     head = _section(html_doc, "thead")
     assert '<th class="current">Jun 2026</th>' in head
     assert head.count('class="current"') == 1  # only the current month stands out
@@ -105,21 +106,22 @@ def test_d2_current_month_column_rendered_even_when_empty():
     # yet the column must exist and carry the current marker in head and body.
     cash_tx = pd.DataFrame([_div_row("OLD", 5.0, dt.date(2026, 1, 5), dt.date(2026, 1, 15))])
     cal = dividends.build_calendar(_positions("OLD"), cash_tx, pd.DataFrame(), today=TODAY)
-    html_doc = app._calendar_html(cal)
+    html_doc = app._calendar_html(cal, dark=False)
     assert '<th class="current">Jun 2026</th>' in html_doc
     assert '<td class="current"></td>' in _section(html_doc, "tbody")  # empty but marked
     assert '<td class="current"></td>' in _section(html_doc, "tfoot")  # Total empty too
 
 
 def test_d3_total_footer_row():
-    html_doc = app._calendar_html(_composite_calendar())
+    html_doc = app._calendar_html(_composite_calendar(), dark=False)
     foot = _section(html_doc, "tfoot")
     assert foot.startswith("<tr><th>Total</th>")
     cells = re.findall(r"<td[^>]*>([^<]*)</td>", foot)
     head_labels = re.findall(r"<th[^>]*>([^<]*)</th>", _section(html_doc, "thead"))[1:]
     by_month = dict(zip(head_labels, cells))
+    assert by_month["Total"] == "250.00"      # grand paid total = paid_sum
     assert by_month["Mar 2026"] == "150.00"   # paid 50 (GRN) + paid 100 (YEL gross)
-    assert by_month["Jun 2026"] == "40.00"    # declared (yellow) counts in Total
+    assert by_month["Jun 2026"] == ""         # declared (yellow) is unpaid -> not summed
     assert by_month["Aug 2026"] == ""         # red "Declare" month -> empty Total
     assert by_month["Sep 2026"] == ""         # red "Pay" month -> empty Total
     assert by_month["Apr 2026"] == ""         # no data -> empty, not 0.00
@@ -131,19 +133,19 @@ def test_d4_held_ticker_without_data_renders_placeholder_row():
     cash_tx = pd.DataFrame([_div_row("GRN", 50.0, dt.date(2026, 2, 20), dt.date(2026, 3, 15))])
     cal = dividends.build_calendar(_positions("GRN", "NEW"), cash_tx, pd.DataFrame(), today=TODAY)
     assert cal.no_data == {"NEW"}
-    html_doc = app._calendar_html(cal)
+    html_doc = app._calendar_html(cal, dark=False)
     body = _section(html_doc, "tbody")
     n_cols = len(cal.values.columns)
     assert (
-        f'<tr><th>NEW</th><td class="nodata" colspan="{n_cols}">'
-        "— no dividend data yet —</td></tr>" in body
+        f'<tr><th>NEW</th><td class="tickertotal"></td><td class="nodata" colspan="{n_cols}">'
+        "— no dividends —</td></tr>" in body
     )
     assert body.count("<tr>") == 2  # GRN data row + NEW placeholder row
 
 
 def test_d6_red_cells_render_words_only_never_amounts():
     for net in (False, True):  # identical in both tax modes
-        html_doc = app._calendar_html(_composite_calendar(net=net))
+        html_doc = app._calendar_html(_composite_calendar(net=net), dark=False)
         word_cells = re.findall(r'<td class="word(?: current)?"[^>]*>([^<]*)</td>', html_doc)
         assert sorted(word_cells) == ["Declare", "Pay"]
         for text in word_cells:
@@ -151,7 +153,7 @@ def test_d6_red_cells_render_words_only_never_amounts():
 
 
 def test_d9_tooltips_title_attrs():
-    html_doc = app._calendar_html(_composite_calendar())
+    html_doc = app._calendar_html(_composite_calendar(), dark=False)
     # Yellow declared cell: declaration + pay dates, dd-mm-yyyy, in title=.
     assert 'title="declaration: 12-05-2026\npay: 06-06-2026"' in html_doc
     # Red projected cells: estimated day from GRN's history (ex 20th, pay 15th),
@@ -164,7 +166,7 @@ def test_d9_tooltips_title_attrs():
 
 def test_d9_yellow_current_month_cell_classes_and_title():
     # YEL's accrual pays in the current month: declared + current classes stack.
-    html_doc = app._calendar_html(_composite_calendar())
+    html_doc = app._calendar_html(_composite_calendar(), dark=False)
     assert re.search(
         r'<td class="declared current" title="declaration: 12-05-2026\npay: 06-06-2026">40\.00</td>',
         html_doc,
@@ -172,20 +174,20 @@ def test_d9_yellow_current_month_cell_classes_and_title():
 
 
 def test_d10_tax_mode_recomputes_cells_and_total_in_html():
-    gross = app._calendar_html(_composite_calendar(net=False))
-    net = app._calendar_html(_composite_calendar(net=True))
+    gross = app._calendar_html(_composite_calendar(net=False), dark=False)
+    net = app._calendar_html(_composite_calendar(net=True), dark=False)
     # YEL paid cell: gross 100.00 -> net 85.00 (real WHTAX, accepted deviation 1)
     assert '<td class="paid">100.00</td>' in gross and "85.00" not in gross
     assert '<td class="paid">85.00</td>' in net and ">100.00</td>" not in net
-    # Declared cell: accrual gross 40 -> net 30; Total row follows in both months.
+    # Declared cell: accrual gross 40 -> net 30; unpaid, so never in the Total row.
     assert ">40.00</td>" in gross and ">30.00</td>" in net
     foot_gross = re.findall(r"<td[^>]*>([^<]*)</td>", _section(gross, "tfoot"))
     foot_net = re.findall(r"<td[^>]*>([^<]*)</td>", _section(net, "tfoot"))
-    assert "150.00" in foot_gross and "40.00" in foot_gross
+    assert "150.00" in foot_gross and "40.00" not in foot_gross
     # GRN has no WHTAX, so net applies the default 25%: 50 -> 37.50; Mar total
     # net = 37.50 + 85.00.
     assert '<td class="paid">37.50</td>' in net
-    assert "122.50" in foot_net and "30.00" in foot_net
+    assert "122.50" in foot_net and "30.00" not in foot_net
     # paid_sum headline recomputes too (full history: GRN 3x50/37.50 + YEL 100/85).
     assert _composite_calendar(net=False).paid_sum == 250.0
     assert _composite_calendar(net=True).paid_sum == 197.5
@@ -238,7 +240,7 @@ def test_d10_defaults_labels_and_caption(div_at):
     assert basis.value == "After tax"            # default = net
     assert list(basis.options) == ["After tax", "Before tax"]
     assert lookback.value == "6M"                # default lookback
-    assert list(lookback.options) == ["3M", "6M", "1Y"]
+    assert list(lookback.options) == ["3M", "6M", "1Y", "All"]
     assert NET_CAPTION in _captions(at)          # caption states active view
     assert GROSS_CAPTION not in _captions(at)
     assert any(m.label == "Paid, last 6 months" for m in at.metric)
@@ -270,3 +272,12 @@ def test_d12_lookback_and_tax_mode_are_independent(div_at):
     assert at.radio(key="div_basis").value == "After tax"
     assert NET_CAPTION in _captions(at)
     assert any(m.label == "Paid, last 3 months" for m in at.metric)
+
+
+def test_d13_lookback_all_shows_full_history(div_at):
+    at = div_at
+    at.run()
+    at.radio(key="div_lookback").set_value("All").run()
+    assert not at.exception and not at.error
+    assert at.radio(key="div_lookback").value == "All"
+    assert any(m.label == "Paid, all time" for m in at.metric)

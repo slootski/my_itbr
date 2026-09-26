@@ -76,7 +76,11 @@ class Calendar:
     columns (``YYYY-MM`` strings, chronological). ``values`` holds display strings
     ("" when empty); ``status`` holds one of paid/declared/pay/declare ("" when
     empty); ``tooltips`` holds hover text ("" when none). ``totals`` is the
-    per-month sum of displayed paid+declared amounts (formatted, "" when none).
+    per-month sum of paid amounts only (formatted, "" when none) — money not yet
+    received never feeds a sum. ``ticker_totals`` is the per-symbol paid sum over
+    the same window as ``paid_sum`` (formatted, "" when none). ``declared_sum``
+    is the total of declared-but-unpaid (yellow) amounts from the current month
+    on — shown on its own, never added to any paid total.
     ``paid_sum`` is the trailing sum of paid dividends over the lookback window
     ending at (and including) the current month. ``no_data`` lists held tickers
     with no dividend events at all (their rows are empty placeholders).
@@ -87,6 +91,8 @@ class Calendar:
     status: pd.DataFrame
     tooltips: pd.DataFrame
     current_ym: str
+    ticker_totals: pd.Series
+    declared_sum: float
     totals: pd.Series = field(default_factory=lambda: pd.Series(dtype=object))
     paid_sum: float = 0.0
     no_data: set[str] = field(default_factory=set)
@@ -774,7 +780,10 @@ def build_calendar(
             len(held), len(paid), len(declared), today, lookback_months,
         )
         empty = pd.DataFrame()
-        return Calendar(values=empty, status=empty, tooltips=empty, current_ym=current_ym)
+        return Calendar(
+            values=empty, status=empty, tooltips=empty, current_ym=current_ym,
+            ticker_totals=pd.Series(dtype=object), declared_sum=0.0,
+        )
 
     # Columns: trailing lookback window (or full history) through the last event,
     # with the current month always present as the "today" anchor.
@@ -784,13 +793,19 @@ def build_calendar(
     columns = [_ym_from_idx(i) for i in range(start_idx, all_idx[-1] + 1)]
     colset = set(columns)
 
-    # Trailing paid-only sum over [window start .. current month], green cells only.
-    paid_sum = sum(
-        ev["value"]
+    # Trailing paid-only sums over [window start .. current month], green cells only.
+    ticker_paid = {
+        sym: sum(
+            ev["value"]
+            for ym, ev in events[sym].items()
+            if ev["status"] == "paid" and ev["value"] is not None
+            and start_idx <= _idx(ym) <= cur_idx
+        )
         for sym in symbols
-        for ym, ev in events[sym].items()
-        if ev["status"] == "paid" and ev["value"] is not None
-        and start_idx <= _idx(ym) <= cur_idx
+    }
+    paid_sum = sum(ticker_paid.values())
+    ticker_totals = pd.Series(
+        {sym: _fmt(v) if v else "" for sym, v in ticker_paid.items()}, dtype=object
     )
 
     values = pd.DataFrame("", index=symbols, columns=columns)
@@ -807,8 +822,16 @@ def build_calendar(
                 text = f"≈{text}"
             values.at[sym, ym] = text
             tooltips.at[sym, ym] = ev["tip"]
-            if ev["status"] in ("paid", "declared") and ev["value"] is not None:
+            if ev["status"] == "paid" and ev["value"] is not None:
                 totals_num[ym] = totals_num.get(ym, 0.0) + ev["value"]
+
+    declared_sum = sum(
+        ev["value"]
+        for sym in symbols
+        for ym, ev in events[sym].items()
+        if ev["status"] == "declared" and ev["value"] is not None
+        and ym in colset and ym >= current_ym
+    )
 
     totals = pd.Series(
         {c: _fmt(totals_num[c]) if c in totals_num else "" for c in columns}, dtype=object
@@ -835,6 +858,8 @@ def build_calendar(
         df.index.name = "Ticker"
     return Calendar(
         values=values, status=status, tooltips=tooltips,
-        current_ym=current_ym, totals=totals, paid_sum=float(paid_sum),
+        current_ym=current_ym, ticker_totals=ticker_totals,
+        declared_sum=float(declared_sum), totals=totals,
+        paid_sum=float(paid_sum),
         no_data=no_data, projected=projected,
     )

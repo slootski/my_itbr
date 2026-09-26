@@ -471,34 +471,98 @@ _DIV_CLASSES = {"paid": "paid", "declared": "declared", "pay": "word", "declare"
 
 _DIV_CSS = """
 <style>
-/* Scrollable viewport: the table grows with the ticker count; past ~70% of
-   the screen it scrolls instead, with month header / Total footer / ticker
-   column pinned. border-collapse:separate is required — collapsed borders
-   detach from sticky cells and scroll away. */
-.divcal-wrap { overflow: auto; max-height: 70vh; border: 1px solid #e2e6ea; }
-.divcal { border-collapse: separate; border-spacing: 0; font-size: 13px; background: #fff; color: #1f2933; }
-.divcal th, .divcal td { border-right: 1px solid #e2e6ea; border-bottom: 1px solid #e2e6ea; padding: 6px 10px; text-align: right; white-space: nowrap; }
-.divcal thead th { background: #f1f3f5; text-align: center; font-weight: 600; color: #495057; position: sticky; top: 0; z-index: 2; }
-.divcal tbody th { text-align: left; background: #f8f9fa; font-weight: 700; position: sticky; left: 0; z-index: 1; }
+/* Theme tokens: one light and one dark set, picked by the wrapper class that
+   follows the Streamlit theme. Status fills are low-alpha tints so the
+   numbers (always in text ink, never the status color) stay readable. */
+.divcal-root {
+  --surface: #fcfcfb; --surface-2: #f4f4f1; --ink: #0b0b0b; --ink-2: #52514e;
+  --muted: #898781; --line: #e1e0d9; --line-strong: #c3c2b7;
+  --paid: rgba(12,163,12,0.14); --paid-dot: #0ca30c;
+  --declared: rgba(250,178,25,0.22); --declared-dot: #d99a0e;
+  --expected: #ec835a; --accent: #2a78d6; --accent-tint: rgba(42,120,214,0.08);
+  --bar: #86b6ef; --hover: color-mix(in srgb, var(--surface) 95%, var(--ink));
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--ink);
+}
+.divcal-root.dark {
+  --surface: #16181d; --surface-2: #1d2027; --ink: #f5f5f3; --ink-2: #c3c2b7;
+  --muted: #898781; --line: #2a2d34; --line-strong: #3a3e47;
+  --paid: rgba(12,163,12,0.20); --paid-dot: #0ca30c;
+  --declared: rgba(250,178,25,0.18); --declared-dot: #fab219;
+  --expected: #ec835a; --accent: #3987e5; --accent-tint: rgba(57,135,229,0.10);
+  --bar: #256abf; --hover: color-mix(in srgb, var(--surface) 94%, var(--ink));
+}
+.divcal-legend { display: flex; flex-wrap: wrap; gap: 18px; margin: 0 0 10px; font-size: 12.5px; color: var(--ink-2); }
+.divcal-legend span { display: inline-flex; align-items: center; gap: 7px; }
+.divcal-legend i { width: 14px; height: 14px; border-radius: 4px; display: inline-block; }
+.divcal-legend .sw-paid { background: var(--paid); box-shadow: inset 0 0 0 1px var(--paid-dot); }
+.divcal-legend .sw-declared { background: var(--declared); box-shadow: inset 0 0 0 1px var(--declared-dot); }
+.divcal-legend .sw-expected { outline: 1px dashed var(--expected); outline-offset: -1px; }
+.divcal-legend .sw-current { background: var(--accent-tint); box-shadow: inset 2px 0 0 var(--accent), inset -2px 0 0 var(--accent); }
+
+/* Scrollable viewport: past ~70% of the screen the table scrolls, with month
+   header / Total footer / ticker column pinned. border-collapse:separate is
+   required — collapsed borders detach from sticky cells and scroll away. */
+.divcal-wrap { overflow: auto; max-height: 70vh; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
+.divcal { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 13px; color: var(--ink); font-variant-numeric: tabular-nums; }
+.divcal th, .divcal td { border-bottom: 1px solid var(--line); padding: 9px 12px; text-align: right; white-space: nowrap; }
+.divcal thead th { background: var(--surface-2); color: var(--muted); font-weight: 600; font-size: 11.5px;
+  letter-spacing: 0.03em; text-transform: uppercase; text-align: right; position: sticky; top: 0; z-index: 2;
+  border-bottom: 1px solid var(--line-strong); }
+.divcal thead th:first-child, .divcal tbody th { text-align: left; }
+.divcal tbody th { background: var(--surface); font-weight: 650; color: var(--ink); position: sticky; left: 0; z-index: 1; letter-spacing: 0.02em; }
 .divcal thead th:first-child { left: 0; z-index: 3; }
-.divcal .current { box-shadow: inset 2px 0 0 #2c6e9b, inset -2px 0 0 #2c6e9b; }
-.divcal thead .current { background: #2c6e9b; color: #fff; font-weight: 700; }
-.divcal .paid { background: #bfe3c2; }
-.divcal .declared { background: #f7e6a8; cursor: help; }
-.divcal .word { background: #f8c8c4; font-style: italic; text-align: center; color: #7a2e28; cursor: help; text-decoration: underline dotted; }
-.divcal .nodata { background: #f8f9fa; color: #868e96; font-style: italic; text-align: center; }
-.divcal tfoot th, .divcal tfoot td { background: #eceff1; font-weight: 700; border-top: 2px solid #adb5bd; position: sticky; bottom: 0; z-index: 2; }
-.divcal tfoot th { left: 0; z-index: 3; }
-.divcal tfoot .current { background: #d6e4ee; }
+/* Row hover: opaque (sticky cells must hide what scrolls under them) and
+   never over a status tint. */
+.divcal tbody tr:hover > th, .divcal tbody tr:hover > td:not(.paid):not(.declared):not(.current) { background-color: var(--hover); }
+.divcal tbody tr:last-child th, .divcal tbody tr:last-child td { border-bottom: none; }
+
+.divcal .current { background-color: var(--accent-tint); box-shadow: inset 1px 0 0 var(--accent), inset -1px 0 0 var(--accent); }
+.divcal thead .current { color: var(--accent); background: var(--surface-2); box-shadow: inset 0 -2px 0 var(--accent); }
+
+.divcal td.paid { background: var(--paid); }
+.divcal td.declared { background: var(--declared); cursor: help; }
+.divcal td.declared.current, .divcal td.paid.current { background-image: linear-gradient(var(--accent-tint), var(--accent-tint)); }
+.divcal td.word { color: var(--expected); font-size: 11.5px; font-weight: 600; text-align: center; cursor: help;
+  outline: 1px dashed var(--expected); outline-offset: -6px; border-radius: 8px; }
+.divcal .nodata { color: var(--muted); font-style: italic; text-align: center; }
+
+.divcal th.tickertotal, .divcal td.tickertotal { font-weight: 700; border-right: 1px solid var(--line-strong); }
+.divcal tbody td.tickertotal { padding-bottom: 13px; background: linear-gradient(var(--bar), var(--bar)) no-repeat right 12px bottom 5px / calc((100% - 24px) * var(--pct, 0)) 3px; }
+
+.divcal tfoot th, .divcal tfoot td { background: var(--surface-2); font-weight: 700; color: var(--ink);
+  border-top: 1px solid var(--line-strong); border-bottom: none; position: sticky; bottom: 0; z-index: 2; }
+.divcal tfoot td.tickertotal { background: var(--surface-2); }
+.divcal tfoot th { left: 0; z-index: 3; text-align: left; }
+.divcal tfoot .current { background-color: var(--surface-2); color: var(--accent); }
 </style>
 """
 
+_DIV_LEGEND = (
+    '<div class="divcal-legend">'
+    '<span><i class="sw-paid"></i>Paid</span>'
+    '<span><i class="sw-declared"></i>Declared, not paid yet</span>'
+    '<span><i class="sw-expected"></i>Expected (estimated from history)</span>'
+    '<span><i class="sw-current"></i>Current month</span>'
+    "</div>"
+)
 
-def _calendar_html(cal: dividends.Calendar) -> str:
-    """Render the calendar as an HTML table: status colors, current-month
-    highlight, native hover tooltips (title), and a Total footer row."""
+
+def _pct(total: str, top: float) -> str:
+    """Bar length (0..1) for a formatted ticker total relative to the largest."""
+    if not total or top <= 0:
+        return ""
+    return f"{float(total.replace(',', '')) / top:.3f}"
+
+
+def _calendar_html(cal: dividends.Calendar, dark: bool) -> str:
+    """Render the calendar as an HTML table: status tints, current-month
+    highlight, native hover tooltips (title), a per-ticker Total column with a
+    magnitude bar, and a Total footer row. ``dark`` follows the app theme."""
     cols = list(cal.values.columns)
     cur = cal.current_ym
+    top = max(
+        (float(v.replace(",", "")) for v in cal.ticker_totals if v), default=0.0
+    )
 
     head = "".join(
         f'<th class="{"current" if c == cur else ""}">{dividends.month_label(c)}</th>'
@@ -506,10 +570,14 @@ def _calendar_html(cal: dividends.Calendar) -> str:
     )
     rows = []
     for sym in cal.values.index:
+        tot = str(cal.ticker_totals[sym])
+        pct = _pct(tot, top)
+        style = f' style="--pct:{pct}"' if pct else ""
+        total = f'<td class="tickertotal"{style}>{html.escape(tot)}</td>'
         if sym in cal.no_data:
             rows.append(
-                f'<tr><th>{html.escape(str(sym))}</th>'
-                f'<td class="nodata" colspan="{len(cols)}">— no dividend data yet —</td></tr>'
+                f'<tr><th>{html.escape(str(sym))}</th>{total}'
+                f'<td class="nodata" colspan="{len(cols)}">— no dividends —</td></tr>'
             )
             continue
         cells = []
@@ -520,17 +588,20 @@ def _calendar_html(cal: dividends.Calendar) -> str:
             tip = cal.tooltips.at[sym, c]
             title = f' title="{html.escape(tip)}"' if tip else ""
             cells.append(f'<td class="{klass}"{title}>{html.escape(str(cal.values.at[sym, c]))}</td>')
-        rows.append(f'<tr><th>{html.escape(str(sym))}</th>{"".join(cells)}</tr>')
+        rows.append(f'<tr><th>{html.escape(str(sym))}</th>{total}{"".join(cells)}</tr>')
     foot = "".join(
         f'<td class="{"current" if c == cur else ""}">{html.escape(str(cal.totals[c]))}</td>'
         for c in cols
     )
+    theme = "divcal-root dark" if dark else "divcal-root"
     return (
-        f'{_DIV_CSS}<div class="divcal-wrap"><table class="divcal">'
-        f'<thead><tr><th>Ticker</th>{head}</tr></thead>'
+        f'{_DIV_CSS}<div class="{theme}">{_DIV_LEGEND}'
+        f'<div class="divcal-wrap"><table class="divcal">'
+        f'<thead><tr><th>Ticker</th><th class="tickertotal">Total</th>{head}</tr></thead>'
         f'<tbody>{"".join(rows)}</tbody>'
-        f'<tfoot><tr><th>Total</th>{foot}</tr></tfoot>'
-        f"</table></div>"
+        f'<tfoot><tr><th>Total</th>'
+        f'<td class="tickertotal">{cal.paid_sum:,.2f}</td>{foot}</tr></tfoot>'
+        f"</table></div></div>"
     )
 
 
@@ -553,18 +624,19 @@ def _coverage_days(cov: dict) -> int | None:
     return (cov["max_date"] - cov["min_date"]).days + 1
 
 
-def _render_coverage_notice(cov: dict, lookback_months: int) -> None:
+def _render_coverage_notice(cov: dict, lookback_months: int | None) -> None:
     """Coverage warning banner + always-on data-coverage caption (F1).
 
     Warns when the statement's cash-transaction history is too short for the
     selected lookback: no dated rows at all, or a covered span under half the
-    lookback window. The half-window grace avoids false alarms for sparse
+    lookback window (``None`` = "All": no window, so only the no-data case
+    warns). The half-window grace avoids false alarms for sparse
     payers (a quarterly payer's first/last payments rarely span the full
     window); the live failure mode this targets — Flex period =
     LastBusinessDay, a 1-day statement — sits far below any threshold.
     """
     days = _coverage_days(cov)
-    threshold = lookback_months * 30 // 2
+    threshold = lookback_months * 30 // 2 if lookback_months else 0
     if cov["rows"] == 0 or days is None:
         st.warning(
             "Flex statement contains no dated cash-transaction history — too "
@@ -591,23 +663,13 @@ def _render_coverage_notice(cov: dict, lookback_months: int) -> None:
 
 def tab_dividends(data: dict) -> None:
     st.subheader("Dividend calendar")
-    st.caption(
-        "Rows = held tickers, columns = months. "
-        "🟩 paid · 🟨 declared (unpaid) · 🟥 pending — “Declare” / “Pay”. "
-        "Red cells mark each ticker's estimated next declaration/payment "
-        "(from its historical cadence); the amount is unknown until declared. "
-        "Hover yellow/red cells for dates — a red cell's “~” day is inferred "
-        "from past dates, not confirmed. IBKR data always wins. Gaps are "
-        "backfilled from Polygon (declared amount, yellow) and yfinance "
-        "(dates only, red); hover shows the source. Greyed rows are held "
-        "tickers with no dividend data from any source yet."
-    )
 
-    c1, c2 = st.columns(2)
+    c1, c2, _ = st.columns([1, 1, 2])
     basis = c1.radio("Amounts", ["After tax", "Before tax"], horizontal=True, key="div_basis")
-    lookback = c2.radio("Lookback", ["3M", "6M", "1Y"], index=1, horizontal=True, key="div_lookback")
+    lookback = c2.radio("Lookback", ["3M", "6M", "1Y", "All"], index=1, horizontal=True, key="div_lookback")
     net = basis == "After tax"
-    months = {"3M": 3, "6M": 6, "1Y": 12}[lookback]
+    # "All" = no window: everything since the first dividend on record.
+    months = {"3M": 3, "6M": 6, "1Y": 12, "All": None}[lookback]
     st.caption(
         f"Amounts after tax (IBKR withholding per ticker; "
         f"{dividends.DEFAULT_TAX_RATE:.0%} where IBKR withheld nothing)."
@@ -660,11 +722,42 @@ def tab_dividends(data: dict) -> None:
         )
         return
 
-    st.metric(
-        f"Paid, last {'1 year' if months == 12 else f'{months} months'}",
+    # Months elapsed in the window (first column .. current month) for the average.
+    cols = list(cal.values.columns)
+    elapsed = cols.index(cal.current_ym) + 1 if cal.current_ym in cols else len(cols)
+    paying = sum(1 for v in cal.ticker_totals if v)
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric(
+        "Paid, all time" if months is None
+        else f"Paid, last {'1 year' if months == 12 else f'{months} months'}",
         f"{cal.paid_sum:,.2f}",
+        border=True,
     )
-    st.html(_calendar_html(cal))
+    m2.metric("Monthly average", f"{cal.paid_sum / elapsed:,.2f}", border=True,
+              help=f"Paid total over {elapsed} month(s), current month included.")
+    m3.metric("Declared, not paid yet", f"{cal.declared_sum:,.2f}", border=True,
+              help="Announced amounts still to be paid. Not included in any paid total.")
+    m4.metric("Paying tickers", f"{paying} of {len(cal.values.index)}", border=True)
+
+    st.html(_calendar_html(cal, dark=st.context.theme.type == "dark"))
+
+    with st.expander("How to read this calendar"):
+        st.markdown(
+            "- **Rows** are held tickers, **columns** are months. **Total** "
+            "(next to each ticker) sums what that ticker paid in the selected "
+            "period; the bar under it compares tickers.\n"
+            "- **Green** = paid. **Amber** = declared but not paid yet. "
+            "**Dashed “Declare” / “Pay”** = the next declaration or payment, "
+            "estimated from the ticker's history; the amount is unknown until "
+            "declared.\n"
+            "- Only paid money is summed. Declared and expected amounts never "
+            "count toward any total.\n"
+            "- Hover amber and dashed cells for dates; a “~” day is estimated, "
+            "not confirmed. IBKR data always wins; gaps are filled from Polygon "
+            "(declared amounts) and yfinance (dates only), and the tooltip shows "
+            "the source.\n"
+            "- “No dividends” rows are held tickers that pay none."
+        )
 
 
 def _clip_nav_table(nav_history: pd.DataFrame, range_label: str) -> pd.DataFrame:
