@@ -1,0 +1,167 @@
+# Redesign: "Connect your IBKR account" screen (missing / expired API key)
+
+## Context
+Project: `/Users/islootski/Project/my/my_itbr_nokey` (Streamlit IBKR dashboard, a copy
+of `my_itbr` with no API key and an empty DB). Work in this copy only.
+
+Screenshot of the current screen: `/Users/islootski/screenshots/Screenshot 2026-09-26 at 17.21.12.png`.
+Read it first. It shows the screen a user sees when the Flex credentials are missing,
+after clicking "🔑 Enter API key" and typing an invalid Query ID.
+
+The screen works but is not user friendly. The fonts and colours do not help the user,
+and the text is long and in the wrong order. Redesign the screen so a non-technical
+user can connect their IBKR account in under 2 minutes without reading `.env` docs.
+
+Relevant code (read before changing anything):
+- `app.py`: `main()` (credential-missing branch and the `flex.FlexError` branch),
+  `render_api_key_entry()`, `_YODLEE_NOTE`, `render_token_expired()`, `render_sidebar()`,
+  `_IBKR_TOKEN_PATH`, `st.set_page_config(...)` at the top.
+- `config.py`: `ENV_PATH`, `is_real_value()`, `save_env_values()`.
+- `tests/test_app_smoke.py`: section "API key entry button" and "token expiry" tests.
+- There is NO `.streamlit/config.toml` today, so the app uses Streamlit's default theme.
+
+## Problems to fix (from the screenshot)
+1. Blue text on a dark blue box (`st.info` with the Yodlee note). Low contrast and it is
+   the longest text on the screen.
+2. Two sets of instructions: the yellow warning says "copy `.env.example` to `.env` and
+   edit it"; the button does the same job with no file editing. They compete.
+3. Wrong order: a paragraph about Yodlee (the key NOT to use) comes before the fields.
+4. Validation error is not next to the field. The Query ID field turns red, but the only
+   text beside it is "Press Enter to submit form"; the "digits only" message is elsewhere.
+5. The primary action does not stand out: "🔑 Enter API key" and "OK" are secondary
+   buttons. There is no Cancel.
+6. Noise: the sidebar shows full file paths for the DB and backups; the Net Worth
+   controls (Range, Split out dividend income) show below the form with no data.
+7. Wrong IBKR menu path. The app says "Account Management → Reporting → Flex Web Service".
+   The current Client Portal path is **Performance & Reports → Flex Queries → Flex Web
+   Service Configuration** (or Menu → Reporting → Flex Queries → Flex Web Service
+   Configuration). Fix `_IBKR_TOKEN_PATH` and every text that uses it.
+
+## Facts to use in the text (verified; do not invent others)
+- IBKR Flex tokens expire after **6 hours by default**. The user picks the period in the
+  "Should Expire After" list, up to 1 year. Tell the user to pick the longest period.
+- Generating a new token replaces the old one; the old token stops working.
+- The token is shown once in IBKR; the user must copy it immediately.
+- "Valid For IP Address" is optional; blank means no IP restriction.
+- The token is a long number; the Flex Query ID is a short number (e.g. 1537307).
+- "Yodlee" in IBKR is an entry under Performance & Reports → Third-Party Reports →
+  Third-Party Services. It issues a token + query ID for the Yodlee aggregator (Kubera,
+  Empower, Snowball). IBKR defines that query, and third-party guides (not IBKR) report
+  it carries only base-currency cash balances. This app needs a Flex Web Service token
+  plus the user's own Flex Query ID. Do NOT claim whether the Yodlee token string is
+  the same as the account's Flex token; that is not verified.
+- Error 1012 = token expired, 1015 = token invalid (see `ibkr/flex.py`).
+
+## Target design
+One calm card instead of two alert boxes, in this order:
+1. Heading: "Connect your IBKR account" (expired case: "Your IBKR token has expired";
+   invalid case: "IBKR did not accept your token"). One sentence under it saying the
+   data on this computer is safe and Net Worth still works.
+2. One primary button: "Connect IBKR account" (expired/invalid: "Enter new token").
+3. The button opens a modal with `st.dialog` (title "Connect IBKR", width "medium") that
+   contains, top to bottom:
+   - Numbered steps (max 4, one line each) to get the token, using the correct menu path
+     and the "pick the longest expiry" tip.
+   - Field "Flex Web Service token" (`type="password"`, `placeholder`, `help=`), with a
+     one-line hint under it: "Use the Flex Web Service token, not the Yodlee token."
+   - Field "Flex Query ID" only when the query ID is missing (existing rule), hint
+     "Numbers only, e.g. 1537307".
+   - Errors shown directly under the field they belong to, in plain words.
+   - Buttons: primary "Save and connect", secondary "Cancel".
+   - A collapsed `st.expander("Which token do I need?")` with the Yodlee explanation,
+     written short (max 4 sentences).
+4. After save: success message ("Connected. Loading your data…"), then the normal tabs.
+5. Hide the Net Worth controls on this screen when there is no NAV history; show one
+   line instead ("Net Worth appears after the first successful refresh").
+6. Sidebar: replace full paths with short status ("Database: ready", "Backups: none yet")
+   and put the full path in `help=` tooltips.
+
+## Theme (create `.streamlit/config.toml`)
+Keys verified with `.venv/bin/streamlit config show` (Streamlit 1.58.0). Use only keys
+from that command's output. Relevant keys:
+- `[theme]`: `base`, `primaryColor`, `backgroundColor`, `secondaryBackgroundColor`,
+  `textColor`, `font`, `headingFont`, `codeFont`, `fontFaces`, `baseFontSize`,
+  `baseFontWeight`, `baseRadius`, `buttonRadius`, `borderColor`, `showWidgetBorder`,
+  `showSidebarBorder`, `linkColor`, `linkUnderline`.
+- Alert colours (this fixes the blue-on-blue box): `blueColor`, `blueBackgroundColor`,
+  `blueTextColor`, and the same for `red`, `orange`, `yellow`, `green`, `violet`, `gray`.
+- Charts: `chartCategoricalColors`, `chartSequentialColors`, `chartDivergingColors`.
+- Sections: `[theme.sidebar]`, `[theme.light]`, `[theme.dark]`, `[theme.light.sidebar]`,
+  `[theme.dark.sidebar]`. Define both light and dark so the app follows the OS setting.
+Rules:
+- One readable sans-serif font for body and headings (e.g. "Inter" from Google Fonts via
+  `fontFaces`, or the system font stack). Monospace only for code.
+- Every text/background pair must meet WCAG 2.2 AA: 4.5:1 for body text, 3:1 for large
+  text and UI borders. Check each pair and list the ratios in your report.
+- Gain/loss colours must be colour-blind safe and never rely on colour alone (keep the
+  + / − sign).
+- Do not remove the existing custom CSS at `app.py` line ~473 unless the theme replaces it.
+
+## Expert roles to apply (review your own work in each role before finishing)
+- **Content designer / UX writer:** short labels, one idea per sentence, plain words,
+  action-first buttons, errors that say what to do.
+- **UI / visual designer:** hierarchy (one primary action per screen), spacing, font,
+  palette, consistent button styles.
+- **Accessibility reviewer:** WCAG 2.2 AA contrast, keyboard use in the dialog (Tab,
+  Enter, Esc), labels on every field, no colour-only meaning.
+- **Streamlit developer:** use built-in theme keys and widget parameters (`type=`,
+  `help=`, `placeholder=`, `st.dialog`) before any custom CSS.
+- **Fintech dashboard UX (optional, for later tabs):** number formats, gains/losses, charts.
+
+## Documentation
+- Streamlit theming: https://docs.streamlit.io/develop/concepts/configuration/theming
+- Streamlit `st.dialog`: https://docs.streamlit.io/develop/api-reference/execution-flow/st.dialog
+  (signature `st.dialog(title, *, width, dismissible, icon, on_dismiss)`; only one dialog
+  per run; no `st.sidebar` inside; close it with `st.rerun()`).
+- Streamlit `st.form`: https://docs.streamlit.io/develop/api-reference/execution-flow/st.form
+- Streamlit `st.text_input` (`type`, `placeholder`, `help`):
+  https://docs.streamlit.io/develop/api-reference/widgets/st.text_input
+- WCAG 2.2 contrast: https://www.w3.org/WAI/WCAG22/Understanding/contrast-minimum.html
+- WebAIM contrast checker: https://webaim.org/resources/contrastchecker/
+- GOV.UK Design System, validation pattern: https://design-system.service.gov.uk/patterns/validation/
+- Nielsen Norman Group, error messages: https://www.nngroup.com/articles/error-message-guidelines/
+- IBKR, Configure Flex Web Service: https://www.ibkrguides.com/clientportal/performanceandstatements/flex3.htm
+- IBKR, Enable Flex Web Service: https://www.ibkrguides.com/clientportal/performanceandstatements/flex-web-service.htm
+- IBKR, Third-Party Reports: https://www.ibkrguides.com/clientportal/performanceandstatements/third-party-reports.htm
+- Yodlee + IBKR (third-party guides): https://help.kubera.com/article/72-connect-to-interactive-brokers-using-yodlee ,
+  https://help.snowball-analytics.com/yodlee-ibkr/
+
+## Claude Code skills and tools to use
+- `artifact-design` + Artifact tool: FIRST build a static HTML mockup of the new screen
+  (card + open dialog, light and dark) and show it to me. Wait for my OK before coding.
+- `dataviz`: palette and chart colour rules for `chartCategoricalColors` etc.
+- `caveman:lean-build`: keep scope to this screen, the sidebar status and the theme.
+- `run` skill or `claude-in-chrome`: launch the app on port **8502**
+  (`.venv/bin/streamlit run app.py --server.port 8502`, never 8501, which the original
+  app uses) and take screenshots of: missing-key screen, open dialog, validation error,
+  expired-token screen (simulate with a fake token), and success. Light and dark.
+- `simplify` then `code-review`: after the change, before reporting.
+
+## Constraints
+- Follow `~/.claude/CLAUDE.md`: no default parameter values in new or changed
+  functions; callers pass every argument as keyword arguments. Existing defaults in
+  `config.py` (`Settings` fields, `os.getenv(..., fallback)`) and `prices.fetch_ohlc`:
+  do not touch them; list them in the report.
+- Never log, print or show the token. Keep the password field.
+- Keep `config.save_env_values` as the only writer of `.env`.
+- Do not change data loading, parsing, or any other tab.
+- `AppTest` support for `st.dialog` is not verified. Check it first with a small test.
+  If `AppTest` cannot drive the dialog, keep the form logic in a plain function that the
+  dialog calls, and test that function plus the button visibility.
+
+## Tests (required)
+- Update the existing "API key entry" and "token expiry" tests to the new texts.
+- Button shows on: missing credentials, error 1012, error 1015. Hidden when data loads.
+- Query ID field shows only when the query ID is missing.
+- Empty token, placeholder token and non-digit query ID are rejected, with the error
+  under the right field, and `.env` is not written.
+- Save writes `.env` (other lines kept), and the app then shows all six tabs.
+- The token value never appears in any rendered element.
+- Full suite: `.venv/bin/python -m pytest -q` passes.
+
+## Deliverable
+1. Mockup link (before coding) and wait for approval.
+2. Code change, theme file, updated tests; full suite result.
+3. Screenshots (light and dark) of each state listed above.
+4. Contrast table: each colour pair, its ratio, pass/fail.
+5. List of existing default parameters you saw but did not change.

@@ -414,39 +414,6 @@ def _flex_code_boom(code: str, message: str):
 from ibkr import flex as flex_mod  # noqa: E402
 
 
-def test_expired_token_shows_regeneration_guidance(monkeypatch, tmp_path):
-    """Flex 1012 must NOT surface the raw error; it shows a dedicated headline
-    plus the exact IBKR path to generate a new token, and keeps Net Worth up."""
-    at = _wire_app(monkeypatch, tmp_path, _flex_code_boom("1012", "Token has expired."))
-    at.run()
-    st.cache_data.clear()
-
-    assert not at.exception
-    errors = [str(e.value) for e in at.error]
-    infos = [str(i.value) for i in at.info]
-    assert any("token has expired" in e.lower() for e in errors), errors
-    assert any("1012" in e for e in errors)
-    assert any("Flex Web Service" in i and "Generate a new token" in i for i in infos), infos
-    assert any("FLEX_TOKEN" in i for i in infos)
-    assert all("smoke-test-token" not in t for t in errors + infos)
-    # Net Worth tab still rendered from local history while the token is fixed.
-    assert any(sb.key == "nav_range" for sb in at.selectbox), (
-        "Net Worth section missing on token-expired screen"
-    )
-
-
-def test_invalid_token_shows_regeneration_guidance(monkeypatch, tmp_path):
-    at = _wire_app(monkeypatch, tmp_path, _flex_code_boom("1015", "Token is invalid."))
-    at.run()
-    st.cache_data.clear()
-
-    assert not at.exception
-    errors = [str(e.value) for e in at.error]
-    infos = [str(i.value) for i in at.info]
-    assert any("1015" in e and "invalid" in e.lower() for e in errors), errors
-    assert any("Generate a new token" in i for i in infos), infos
-
-
 def test_other_flex_codes_keep_generic_error(monkeypatch, tmp_path):
     """1014 (query invalid) is not a token problem — generic path unchanged."""
     at = _wire_app(monkeypatch, tmp_path, _flex_code_boom("1014", "Query is invalid."))
@@ -459,3 +426,156 @@ def test_other_flex_codes_keep_generic_error(monkeypatch, tmp_path):
     assert any("1014" in e for e in errors)
     assert not any("Generate a new token" in i for i in infos)
     assert any("Fix the token/query" in i for i in infos)
+
+
+# ---- connect card + dialog (missing / dead credential only) ----------------
+
+def _texts(at: AppTest) -> list[str]:
+    """Every text-bearing element the user can read, as strings."""
+    groups = (at.markdown, at.caption, at.subheader, at.error, at.info, at.warning,
+              at.success, at.title)
+    return [str(el.value) for group in groups for el in group]
+
+
+def _connect_button(at: AppTest):
+    return [b for b in at.button if b.key == "connect_open"]
+
+
+def _wire_missing_credentials(monkeypatch, tmp_path, env_path):
+    """App with placeholder credentials, .env redirected to ``env_path`` and a
+    fake Flex download that records calls."""
+    import config
+    from data import prices
+    from ibkr import flex
+
+    monkeypatch.setattr(config, "ENV_PATH", env_path)
+    monkeypatch.setenv("FLEX_TOKEN", "your_flex_token_here")
+    monkeypatch.setenv("FLEX_QUERY_ID", "your_flex_query_id_here")
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "key-snapshots.sqlite"))
+    calls: list[tuple[str, str]] = []
+
+    def fake_download(token: str, query_id: str) -> bytes:
+        calls.append((token, query_id))
+        return SYNTHETIC_FLEX_XML
+
+    monkeypatch.setattr(flex, "download_statement", fake_download)
+    monkeypatch.setattr(prices, "fetch_ohlc", lambda symbol, period: _FAKE_OHLC.copy())
+    st.cache_data.clear()
+    return AppTest.from_file(str(APP_PATH), default_timeout=30), calls
+
+
+def test_connect_button_hidden_when_credentials_work(smoke_app):
+    at, _ = smoke_app
+    at.run()
+    assert not at.exception
+    assert not _connect_button(at)
+
+
+@pytest.mark.parametrize(
+    ("code", "message", "heading", "sidebar_status"),
+    [
+        ("1012", "Token has expired.", "Your IBKR token has expired", "IBKR: token expired"),
+        ("1015", "Token is invalid.", "IBKR did not accept your token", "IBKR: token not accepted"),
+    ],
+)
+def test_dead_token_shows_connect_card(monkeypatch, tmp_path, code, message, heading, sidebar_status):
+    """1012/1015: one card (heading, error code, primary button), no raw error
+    box, token never shown, and a hint instead of empty Net Worth controls."""
+    at = _wire_app(monkeypatch, tmp_path, _flex_code_boom(code, message))
+    at.run()
+    st.cache_data.clear()
+
+    assert not at.exception
+    texts = _texts(at)
+    assert heading in [str(h.value) for h in at.subheader]
+    assert f"IBKR error {code}" in texts
+    # The only error box is the sidebar status; no raw Flex error in the page.
+    assert [str(e.value) for e in at.error] == [sidebar_status], [e.value for e in at.error]
+    assert _connect_button(at)[0].label == "Enter new token"
+    assert all("smoke-test-token" not in t for t in texts)
+    assert any("Net Worth appears here" in t for t in texts)
+    assert not [sb for sb in at.selectbox if sb.key == "nav_range"]
+
+
+def test_expired_token_dialog_saves_only_the_token(monkeypatch, tmp_path):
+    """1012: dialog shows steps with the current IBKR path, a token field only
+    (query ID is still valid), and Save writes only FLEX_TOKEN."""
+    import config
+
+    env_path = tmp_path / ".env"
+    env_path.write_text("# keep me\nFLEX_TOKEN=old\nFLEX_QUERY_ID=999999\n")
+    monkeypatch.setattr(config, "ENV_PATH", env_path)
+    at = _wire_app(monkeypatch, tmp_path, _flex_code_boom("1012", "Token has expired."))
+    at.run()
+    assert not at.text_input  # dialog stays closed until the click
+
+    _connect_button(at)[0].click().run()
+    texts = _texts(at)
+    assert any("Performance & Reports → Flex Queries → Flex Web Service Configuration" in t
+               for t in texts), texts
+    assert any("6 hours" in t for t in texts)
+    assert [ti.label for ti in at.text_input] == ["Flex Web Service token"]
+    assert [e.label for e in at.expander] == ["Which token do I need?"]
+
+    at.text_input(key="connect_token").input("  123456789012345678901234  ")
+    at.button(key="connect_save").click().run()
+    st.cache_data.clear()
+
+    assert not at.exception
+    assert env_path.read_text() == (
+        "# keep me\nFLEX_TOKEN=123456789012345678901234\nFLEX_QUERY_ID=999999\n"
+    )
+    assert all("123456789012345678901234" not in t for t in _texts(at))
+
+
+def test_missing_credentials_dialog_validates_then_connects(monkeypatch, tmp_path):
+    """Placeholder credentials: dialog also asks for the query ID; errors show
+    under their fields without writing .env; valid input connects and loads
+    all tabs, and the card disappears."""
+    env_path = tmp_path / ".env"
+    env_path.write_text("FLEX_TOKEN=your_flex_token_here\nFLEX_QUERY_ID=your_flex_query_id_here\n")
+    at, calls = _wire_missing_credentials(monkeypatch, tmp_path, env_path)
+    at.run()
+    assert "Connect your IBKR account" in [str(h.value) for h in at.subheader]
+    assert [str(w.value) for w in at.warning] == ["IBKR: not connected"]
+    assert _connect_button(at)[0].label == "Connect IBKR account"
+    assert not any("env.example" in t for t in _texts(at))  # no manual .env steps
+
+    _connect_button(at)[0].click().run()
+    assert [ti.label for ti in at.text_input] == ["Flex Web Service token", "Flex Query ID"]
+
+    # Empty token + non-digit query ID: both field errors, nothing written.
+    at.text_input(key="connect_query_id").input("abc")
+    at.button(key="connect_save").click().run()
+    texts = _texts(at)
+    assert any("Paste the token from Flex Web Service Configuration" in t for t in texts), texts
+    assert any("Use numbers only" in t for t in texts), texts
+    assert "your_flex_token_here" in env_path.read_text()
+
+    at.text_input(key="connect_token").input("111222333")
+    at.text_input(key="connect_query_id").input("1537307")
+    at.button(key="connect_save").click().run()
+    st.cache_data.clear()
+
+    assert not at.exception, [e.value for e in at.exception]
+    assert env_path.read_text() == "FLEX_TOKEN=111222333\nFLEX_QUERY_ID=1537307\n"
+    assert calls == [("111222333", "1537307")]
+    assert [tab.label for tab in at.tabs] == EXPECTED_TABS
+    assert any("Connected" in str(s.value) for s in at.success)
+    assert any(str(s.value) == "IBKR: connected" for s in at.success)
+    assert not _connect_button(at)
+
+
+def test_dialog_cancel_closes_without_writing(monkeypatch, tmp_path):
+    env_path = tmp_path / ".env"
+    env_path.write_text("FLEX_TOKEN=your_flex_token_here\nFLEX_QUERY_ID=your_flex_query_id_here\n")
+    at, calls = _wire_missing_credentials(monkeypatch, tmp_path, env_path)
+    at.run()
+    _connect_button(at)[0].click().run()
+    at.text_input(key="connect_token").input("111222333")
+    at.button(key="connect_cancel").click().run()
+
+    assert not at.exception
+    assert "connect_dialog_open" not in at.session_state
+    assert "your_flex_token_here" in env_path.read_text()
+    assert calls == []

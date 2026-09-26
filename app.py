@@ -11,10 +11,11 @@ import logging
 
 import pandas as pd
 import streamlit as st
+from streamlit.delta_generator import DeltaGenerator
 
 import logsetup
 from charts import figures
-from config import load_settings
+from config import ENV_PATH, is_real_value, load_settings, save_env_values, validate_credentials
 from data import (
     backup, capital, div_external, div_provider, dividends, history, price_stats,
     prices, snapshots,
@@ -151,12 +152,11 @@ def load_polygon_declared(symbols: tuple[str, ...], polygon_key: str) -> dict:
 
 # ---- sidebar --------------------------------------------------------------
 
-def render_sidebar() -> None:
+def render_sidebar() -> DeltaGenerator:
+    """Render the sidebar; return the empty status slot main() fills once the
+    load outcome (connected / missing / expired / invalid) is known."""
     st.sidebar.header("IBKR Dashboard")
-    if settings.is_configured:
-        st.sidebar.success("Flex credentials loaded")
-    else:
-        st.sidebar.error("Flex credentials missing")
+    status_slot = st.sidebar.empty()
     if st.sidebar.button("🔄 Refresh data", width="stretch"):
         # Clear the cache and let THIS run continue — the button click itself
         # already triggered a rerun, and load_portfolio (called after this in
@@ -166,18 +166,20 @@ def render_sidebar() -> None:
         # for keyed widgets not rendered in a run — so Refresh would silently
         # reset the user's selections to defaults (e4 FE-1 regression).
         st.cache_data.clear()
-    st.sidebar.caption(f"DB: `{settings.db_path}`")
+    db_state = "ready" if settings.db_path.exists() else "empty (created on first refresh)"
+    st.sidebar.caption(f"Database: {db_state}", help=str(settings.db_path))
 
     # The DB is the only copy of history older than the Flex window, so surface
     # the backup state rather than leaving it to be discovered when it's too late.
     state = backup.status(settings.backup_dir)
     if state["count"]:
         st.sidebar.caption(
-            f"Backups: {state['count']} (latest {state['latest_date']}) in "
-            f"`{settings.backup_dir}`"
+            f"Backups: {state['count']} (latest {state['latest_date']})",
+            help=str(settings.backup_dir),
         )
     else:
-        st.sidebar.caption(f"Backups: none yet — will write to `{settings.backup_dir}`")
+        st.sidebar.caption("Backups: none yet", help=str(settings.backup_dir))
+    return status_slot
 
 
 # ---- tabs -----------------------------------------------------------------
@@ -884,72 +886,175 @@ def tab_net_worth(cash_tx: pd.DataFrame | None = None) -> None:
     )
 
 
-# ---- token expiry ---------------------------------------------------------
+# ---- connect / reconnect IBKR ------------------------------------------------
 
-# Flex tokens are issued for at most one year and cannot be renewed — IBKR only
-# lets you generate a new one, which replaces the old.
-_IBKR_TOKEN_PATH = "Account Management → Reporting → Flex Web Service"
+# Current IBKR Client Portal path to the Flex Web Service token page
+# (ibkrguides.com, "Configure Flex Web Service").
+_IBKR_TOKEN_PATH = "Performance & Reports → Flex Queries → Flex Web Service Configuration"
+
+_SAFE_DATA = "Your data on this computer is safe, and Net Worth still works."
+
+# Card text per state: None = credentials missing, else the IBKR Flex error code.
+_CONNECT_CARD = {
+    None: (
+        "Connect your IBKR account",
+        "The dashboard reads your portfolio from IBKR with a Flex Web Service "
+        "token. It takes about 2 minutes.",
+        "Connect IBKR account",
+    ),
+    flex.TOKEN_EXPIRED: (
+        "Your IBKR token has expired",
+        "IBKR tokens stop working after the period chosen when they were "
+        f"created. Enter a new token to load fresh data. {_SAFE_DATA}",
+        "Enter new token",
+    ),
+    flex.TOKEN_INVALID: (
+        "IBKR did not accept your token",
+        "The token was probably replaced by a newer one, or copied with a typo. "
+        f"Enter your current token. {_SAFE_DATA}",
+        "Enter new token",
+    ),
+}
+
+_CONNECT_STEPS = (
+    f"1. In IBKR, open **{_IBKR_TOKEN_PATH}**.\n"
+    "2. In **Should Expire After**, pick the longest period (up to 1 year). "
+    "The default is only 6 hours.\n"
+    "3. Click **Generate New Token** and copy it now. IBKR shows it only once.\n"
+    "4. Paste it below and click **Save and connect**."
+)
+
+# Why a "Yodlee" token is the wrong credential: IBKR lists Yodlee under
+# Third-Party Services; its token + query ID belong to the Yodlee aggregator and
+# the query is defined by IBKR, so it lacks the sections parser.py reads.
+_WHICH_TOKEN = (
+    "Use the token from **Flex Web Service Configuration**. Do not use the token "
+    "next to **Yodlee** under Third-Party Services. That one is for the Yodlee "
+    "aggregator, and its query is reported to hold only cash balances. This app "
+    "needs your own Flex Query, which lists your positions, trades and cash."
+)
+
+_SIDEBAR_TOKEN_STATUS = {flex.TOKEN_EXPIRED: "token expired", flex.TOKEN_INVALID: "token not accepted"}
+
+_CONNECT_OPEN = "connect_dialog_open"
+_CONNECT_SAVED = "connect_saved"
 
 
-def render_token_expired(code: str) -> None:
-    """Actionable guidance for IBKR Flex error 1012 (token expired) / 1015
-    (token invalid). Both mean the credential in ``.env`` is dead and a new one
-    must be generated; nothing in the app can repair it."""
-    if code == flex.TOKEN_EXPIRED:
-        headline = "Your IBKR Flex token has expired (IBKR Flex error 1012)."
-        why = (
-            "IBKR issues Flex Web Service tokens for a fixed term (at most one "
-            "year) and does not renew them. Nothing is wrong with the app or "
-            "your data — the dashboard just can't fetch new statements until "
-            "you replace the token."
-        )
-    else:
-        headline = "IBKR rejected your Flex token (IBKR Flex error 1015: token is invalid)."
-        why = (
-            "The `FLEX_TOKEN` in `.env` is not a token IBKR recognises — it "
-            "was probably regenerated, deactivated, or pasted with a typo. "
-            "Nothing is wrong with the app or your data — the dashboard just "
-            "can't fetch new statements until the token is fixed."
-        )
-    st.error(f"**{headline}**\n\n{why}")
-    st.info(
-        "**How to fix (about 2 minutes):**\n\n"
-        f"1. Log in to IBKR and open **{_IBKR_TOKEN_PATH}**.\n"
-        "2. Click **Generate a new token**. Set the longest expiry IBKR offers "
-        "(1 year) — the old token stops working immediately.\n"
-        "3. Copy the new token into `.env` as `FLEX_TOKEN=...` "
-        "(keep `FLEX_QUERY_ID` as is — the query is unaffected).\n"
-        "4. Restart the app or click **Refresh data** in the sidebar.\n\n"
-        "Your NAV history and trade archive are stored locally and are not "
-        "affected — the **Net Worth** tab below still works from the last "
-        "snapshot. Tip: put the new expiry date in your calendar a week early."
+def _close_connect_dialog() -> None:
+    """on_dismiss callback: the user closed the dialog with X, Esc or a click outside."""
+    if _CONNECT_OPEN in st.session_state:
+        del st.session_state[_CONNECT_OPEN]
+
+
+@st.dialog("Connect IBKR", width="medium", on_dismiss=_close_connect_dialog)
+def connect_dialog(*, query_id_missing: bool) -> None:
+    """Steps + token (and query ID when missing) + Save/Cancel.
+
+    Errors render in a slot directly under their field. The token is never
+    logged or echoed back; it only goes to .env via save_env_values.
+    """
+    st.markdown(_CONNECT_STEPS)
+    token = st.text_input(
+        "Flex Web Service token",
+        type="password",
+        placeholder="Paste the long number from IBKR",
+        key="connect_token",
     )
+    token_slot = st.empty()
+    token_slot.caption("Use the Flex Web Service token, not the Yodlee token.")
+    query_id = ""
+    query_slot = None
+    if query_id_missing:
+        query_id = st.text_input(
+            "Flex Query ID",
+            placeholder="e.g. 1537307",
+            help="The short number shown in your Flex Query's details in IBKR.",
+            key="connect_query_id",
+        )
+        query_slot = st.empty()
+        query_slot.caption("Numbers only.")
+    with st.expander("Which token do I need?"):
+        st.markdown(_WHICH_TOKEN)
+
+    save_col, cancel_col = st.columns([1, 1])
+    save = save_col.button("Save and connect", type="primary", key="connect_save", width="stretch")
+    cancel = cancel_col.button("Cancel", key="connect_cancel", width="stretch")
+    if cancel:
+        del st.session_state[_CONNECT_OPEN]
+        st.rerun()
+    if not save:
+        return
+
+    token = token.strip()
+    query_id = query_id.strip()
+    errors = validate_credentials(token=token, query_id=query_id, query_id_missing=query_id_missing)
+    if "token" in errors:
+        token_slot.markdown(f":red[{errors['token']}]")
+    if "query_id" in errors:
+        query_slot.markdown(f":red[{errors['query_id']}]")
+    if errors:
+        return
+
+    values = {"FLEX_TOKEN": token}
+    if query_id_missing:
+        values["FLEX_QUERY_ID"] = query_id
+    save_env_values(env_path=ENV_PATH, values=values)
+    del st.session_state[_CONNECT_OPEN]
+    st.session_state[_CONNECT_SAVED] = True
+    st.cache_data.clear()
+    st.rerun()
+
+
+def render_connect_card(*, code: str | None, query_id_missing: bool) -> None:
+    """One card with the state's heading, one sentence and the primary action.
+
+    Only called when the credential is missing (``code`` None) or IBKR rejected
+    the token (1012 / 1015), so the button never shows while the app works.
+    """
+    heading, body, action = _CONNECT_CARD[code]
+    with st.container(border=True):
+        st.subheader(heading)
+        st.write(body)
+        if code is not None:
+            st.caption(f"IBKR error {code}")
+        if st.button(action, type="primary", key="connect_open"):
+            st.session_state[_CONNECT_OPEN] = True
+    if _CONNECT_OPEN in st.session_state:
+        connect_dialog(query_id_missing=query_id_missing)
+
+
+def render_net_worth_or_hint() -> None:
+    """Net Worth from local history on the connect screens; a one-line hint
+    instead of empty controls when there is no history yet."""
+    if snapshots.read_history(settings.db_path).empty:
+        st.caption("Net Worth appears here after the first successful data refresh.")
+        return
+    tab_net_worth()
 
 
 # ---- main -----------------------------------------------------------------
 
 def main() -> None:
-    render_sidebar()
+    sidebar_status = render_sidebar()
     st.title("📈 IBKR Dashboard")
+    if _CONNECT_SAVED in st.session_state:
+        del st.session_state[_CONNECT_SAVED]
+        st.success("Connected to IBKR.")
 
     if not settings.is_configured:
-        st.warning(
-            "Flex Web Service credentials not set.\n\n"
-            "1. Copy `.env.example` to `.env`.\n"
-            "2. Set `FLEX_TOKEN` and `FLEX_QUERY_ID` "
-            "(IBKR Account Management → Reporting → Flex Web Service).\n"
-            "3. Click **Refresh data**."
-        )
-        # Net Worth still works from any prior snapshots.
-        tab_net_worth()
+        sidebar_status.warning("IBKR: not connected")
+        render_connect_card(code=None, query_id_missing=not is_real_value(settings.flex_query_id))
+        render_net_worth_or_hint()
         return
 
     try:
         data = load_portfolio(settings.flex_token, settings.flex_query_id, str(settings.db_path))
     except flex.FlexError as exc:
         if exc.code in flex.TOKEN_ERROR_CODES:
-            render_token_expired(exc.code)
+            sidebar_status.error(f"IBKR: {_SIDEBAR_TOKEN_STATUS[exc.code]}")
+            render_connect_card(code=exc.code, query_id_missing=False)
         else:
+            sidebar_status.error("IBKR: download failed")
             msg = str(exc)
             # ibflex embeds the token in request URLs, and the raised FlexError
             # text is intentionally unscrubbed — never show the token on screen.
@@ -959,9 +1064,10 @@ def main() -> None:
             st.info("Fix the token/query in `.env`, then click **Refresh data**.")
         # Net Worth still works from prior snapshots — keep the history reachable
         # while the credential is being fixed.
-        tab_net_worth()
+        render_net_worth_or_hint()
         return
 
+    sidebar_status.success("IBKR: connected")
     overview, positions, trades, price, divs, net_worth = st.tabs(
         ["Overview", "Positions", "Trades", "Prices", "Dividends", "Net Worth"]
     )

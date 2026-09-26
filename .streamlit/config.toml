@@ -1,0 +1,55 @@
+# App theme. Light and dark follow the OS setting; every text/background pair
+# below meets WCAG 2.2 AA (4.5:1 for text, 3:1 for borders).
+
+[theme]
+# System UI font on each OS (SF Pro on macOS, Segoe UI on Windows): readable,
+# no web-font download.
+font = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif"
+headingFont = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif"
+codeFont = "'SF Mono', Menlo, Consolas, monospace"
+baseFontSize = 15
+baseRadius = "8px"
+buttonRadius = "8px"
+showWidgetBorder = true
+
+[theme.light]
+primaryColor = "#1D4ED8"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F3F5F8"
+textColor = "#1B1F24"
+borderColor = "#7D8794"
+linkColor = "#1D4ED8"
+blueBackgroundColor = "#E8F0FF"
+blueTextColor = "#13336B"
+yellowBackgroundColor = "#FFF6D6"
+yellowTextColor = "#5C4400"
+redBackgroundColor = "#FDECEC"
+redTextColor = "#8A1C1C"
+greenBackgroundColor = "#E7F6EC"
+greenTextColor = "#14532D"
+
+[theme.light.sidebar]
+backgroundColor = "#F3F5F8"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#1B1F24"
+
+[theme.dark]
+primaryColor = "#2563EB"
+backgroundColor = "#0F1419"
+secondaryBackgroundColor = "#1A2129"
+textColor = "#E6E8EB"
+borderColor = "#667180"
+linkColor = "#8AB4FF"
+blueBackgroundColor = "#16263D"
+blueTextColor = "#CFE0FF"
+yellowBackgroundColor = "#2E2A14"
+yellowTextColor = "#F5E6A8"
+redBackgroundColor = "#3A1A1C"
+redTextColor = "#FFB4B8"
+greenBackgroundColor = "#13301F"
+greenTextColor = "#BFF0CF"
+
+[theme.dark.sidebar]
+backgroundColor = "#141A21"
+secondaryBackgroundColor = "#1F2731"
+textColor = "#E6E8EB"
