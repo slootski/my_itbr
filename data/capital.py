@@ -18,17 +18,13 @@ import logging
 
 import pandas as pd
 
+from data import div_ledger
+
 logger = logging.getLogger("myitbr.capital")
 
 # IBKR posts both directions of external cash movement under this one type; a
 # withdrawal is simply a negative amount, so a plain sum is net contributions.
 DEPOSIT_TYPE = "DEPOSITWITHDRAW"
-
-# Dividend income, net of the withholding IBKR posts as a separate negative row
-# — the same definition the Dividends tab and the Positions heatmap use, so the
-# three never disagree about what "dividends received" means.
-DIVIDEND_TYPES = frozenset({"DIVIDEND", "PAYMENTINLIEU"})
-WHTAX_TYPE = "WHTAX"
 
 _DATE_COLS = ("settle_date", "datetime", "report_date")
 
@@ -107,32 +103,11 @@ def contributions(cash_tx: pd.DataFrame) -> pd.DataFrame:
 def dividend_income(cash_tx: pd.DataFrame) -> pd.DataFrame:
     """Per-day net dividend income, in base currency, oldest first.
 
-    Withholding tax is folded in, so this is cash that actually landed. Same
-    base-currency rule as ``contributions``: a dividend paid in a non-base
-    currency cannot be added to one paid in base without its rate.
+    Read from ``data.div_ledger`` — the one definition every screen shares — so
+    this band always equals the Dividends tab's after-tax total.
     """
-    empty = pd.DataFrame(columns=["date", "amount", "cumulative"])
-    if cash_tx is None or cash_tx.empty or "type" not in cash_tx:
-        return empty
-
-    kinds = cash_tx["type"].astype(str)
-    rows = cash_tx[kinds.isin(DIVIDEND_TYPES) | (kinds == WHTAX_TYPE)]
-    if rows.empty:
-        return empty
-
-    records = []
-    for _, row in rows.iterrows():
-        amount, date = _base_amount(row), _event_date(row)
-        if amount is None or date is None:
-            continue
-        records.append({"date": date, "amount": amount})
-    if not records:
-        return empty
-
-    df = pd.DataFrame(records).groupby("date", as_index=False)["amount"].sum()
-    df = df.sort_values("date").reset_index(drop=True)
-    df["cumulative"] = df["amount"].cumsum()
-    return df
+    ledger, _ = div_ledger.events(cash_tx=cash_tx)
+    return div_ledger.by_day(ledger=ledger, net=True)
 
 
 def unpriced_deposits(cash_tx: pd.DataFrame) -> int:

@@ -80,7 +80,7 @@ def _section(html_doc: str, tag: str) -> str:
 
 
 def test_d1_month_headers_are_mon_yyyy():
-    html_doc = app._calendar_html(_composite_calendar(), dark=False)
+    html_doc = app._calendar_html(_composite_calendar(), dark=False, marks={})
     head = _section(html_doc, "thead")
     labels = re.findall(r"<th[^>]*>([^<]*)</th>", head)
     assert labels[0] == "Ticker"
@@ -95,7 +95,7 @@ def test_d1_month_headers_are_mon_yyyy():
 
 
 def test_d2_current_month_header_highlighted_exactly_once():
-    html_doc = app._calendar_html(_composite_calendar(), dark=False)
+    html_doc = app._calendar_html(_composite_calendar(), dark=False, marks={})
     head = _section(html_doc, "thead")
     assert '<th class="current">Jun 2026</th>' in head
     assert head.count('class="current"') == 1  # only the current month stands out
@@ -106,14 +106,14 @@ def test_d2_current_month_column_rendered_even_when_empty():
     # yet the column must exist and carry the current marker in head and body.
     cash_tx = pd.DataFrame([_div_row("OLD", 5.0, dt.date(2026, 1, 5), dt.date(2026, 1, 15))])
     cal = dividends.build_calendar(_positions("OLD"), cash_tx, pd.DataFrame(), today=TODAY)
-    html_doc = app._calendar_html(cal, dark=False)
+    html_doc = app._calendar_html(cal, dark=False, marks={})
     assert '<th class="current">Jun 2026</th>' in html_doc
     assert '<td class="current"></td>' in _section(html_doc, "tbody")  # empty but marked
     assert '<td class="current"></td>' in _section(html_doc, "tfoot")  # Total empty too
 
 
 def test_d3_total_footer_row():
-    html_doc = app._calendar_html(_composite_calendar(), dark=False)
+    html_doc = app._calendar_html(_composite_calendar(), dark=False, marks={})
     foot = _section(html_doc, "tfoot")
     assert foot.startswith("<tr><th>Total</th>")
     cells = re.findall(r"<td[^>]*>([^<]*)</td>", foot)
@@ -133,7 +133,7 @@ def test_d4_held_ticker_without_data_renders_placeholder_row():
     cash_tx = pd.DataFrame([_div_row("GRN", 50.0, dt.date(2026, 2, 20), dt.date(2026, 3, 15))])
     cal = dividends.build_calendar(_positions("GRN", "NEW"), cash_tx, pd.DataFrame(), today=TODAY)
     assert cal.no_data == {"NEW"}
-    html_doc = app._calendar_html(cal, dark=False)
+    html_doc = app._calendar_html(cal, dark=False, marks={})
     body = _section(html_doc, "tbody")
     n_cols = len(cal.values.columns)
     assert (
@@ -145,7 +145,7 @@ def test_d4_held_ticker_without_data_renders_placeholder_row():
 
 def test_d6_red_cells_render_words_only_never_amounts():
     for net in (False, True):  # identical in both tax modes
-        html_doc = app._calendar_html(_composite_calendar(net=net), dark=False)
+        html_doc = app._calendar_html(_composite_calendar(net=net), dark=False, marks={})
         word_cells = re.findall(r'<td class="word(?: current)?"[^>]*>([^<]*)</td>', html_doc)
         assert sorted(word_cells) == ["Declare", "Pay"]
         for text in word_cells:
@@ -153,7 +153,7 @@ def test_d6_red_cells_render_words_only_never_amounts():
 
 
 def test_d9_tooltips_title_attrs():
-    html_doc = app._calendar_html(_composite_calendar(), dark=False)
+    html_doc = app._calendar_html(_composite_calendar(), dark=False, marks={})
     # Yellow declared cell: declaration + pay dates, dd-mm-yyyy, in title=.
     assert 'title="declaration: 12-05-2026\npay: 06-06-2026"' in html_doc
     # Red projected cells: estimated day from GRN's history (ex 20th, pay 15th),
@@ -166,7 +166,7 @@ def test_d9_tooltips_title_attrs():
 
 def test_d9_yellow_current_month_cell_classes_and_title():
     # YEL's accrual pays in the current month: declared + current classes stack.
-    html_doc = app._calendar_html(_composite_calendar(), dark=False)
+    html_doc = app._calendar_html(_composite_calendar(), dark=False, marks={})
     assert re.search(
         r'<td class="declared current" title="declaration: 12-05-2026\npay: 06-06-2026">40\.00</td>',
         html_doc,
@@ -174,8 +174,8 @@ def test_d9_yellow_current_month_cell_classes_and_title():
 
 
 def test_d10_tax_mode_recomputes_cells_and_total_in_html():
-    gross = app._calendar_html(_composite_calendar(net=False), dark=False)
-    net = app._calendar_html(_composite_calendar(net=True), dark=False)
+    gross = app._calendar_html(_composite_calendar(net=False), dark=False, marks={})
+    net = app._calendar_html(_composite_calendar(net=True), dark=False, marks={})
     # YEL paid cell: gross 100.00 -> net 85.00 (real WHTAX, accepted deviation 1)
     assert '<td class="paid">100.00</td>' in gross and "85.00" not in gross
     assert '<td class="paid">85.00</td>' in net and ">100.00</td>" not in net
@@ -184,13 +184,13 @@ def test_d10_tax_mode_recomputes_cells_and_total_in_html():
     foot_gross = re.findall(r"<td[^>]*>([^<]*)</td>", _section(gross, "tfoot"))
     foot_net = re.findall(r"<td[^>]*>([^<]*)</td>", _section(net, "tfoot"))
     assert "150.00" in foot_gross and "40.00" not in foot_gross
-    # GRN has no WHTAX, so net applies the default 25%: 50 -> 37.50; Mar total
-    # net = 37.50 + 85.00.
-    assert '<td class="paid">37.50</td>' in net
-    assert "122.50" in foot_net and "30.00" not in foot_net
-    # paid_sum headline recomputes too (full history: GRN 3x50/37.50 + YEL 100/85).
+    # GRN has no WHTAX, so after tax is the real cash: 50 stays 50; Mar total
+    # net = 50.00 + 85.00.
+    assert '<td class="paid">50.00</td>' in net
+    assert "135.00" in foot_net and "30.00" not in foot_net
+    # paid_sum headline recomputes too (full history: GRN 3x50 + YEL 100/85).
     assert _composite_calendar(net=False).paid_sum == 250.0
-    assert _composite_calendar(net=True).paid_sum == 197.5
+    assert _composite_calendar(net=True).paid_sum == 235.0
 
 
 # ---------------------------------------------------------------------------
@@ -198,7 +198,7 @@ def test_d10_tax_mode_recomputes_cells_and_total_in_html():
 # ---------------------------------------------------------------------------
 
 APP_PATH = Path(__file__).resolve().parents[1] / "app.py"
-NET_CAPTION = "Amounts after tax (IBKR withholding per ticker; 25% where IBKR withheld nothing)."
+NET_CAPTION = "Amounts after tax: the cash that landed (dividend minus IBKR's withholding)."
 GROSS_CAPTION = "Amounts before withholding tax (gross)."
 
 _FAKE_OHLC = pd.DataFrame(
@@ -219,7 +219,7 @@ def div_at(monkeypatch, tmp_path):
     monkeypatch.setenv("FLEX_TOKEN", "qa-ui-token")
     monkeypatch.setenv("FLEX_QUERY_ID", "424242")
     monkeypatch.setenv("DB_PATH", str(tmp_path / "qa-ui.sqlite"))
-    monkeypatch.setattr(flex, "download_statement", lambda t, q: SYNTHETIC_FLEX_XML)
+    monkeypatch.setattr(flex, "download_statement", lambda token, query_id, date_range: SYNTHETIC_FLEX_XML)
     monkeypatch.setattr(prices, "fetch_ohlc", lambda *a, **k: _FAKE_OHLC.copy())
     st.cache_data.clear()
     yield AppTest.from_file(str(APP_PATH), default_timeout=30)
@@ -281,3 +281,25 @@ def test_d13_lookback_all_shows_full_history(div_at):
     assert not at.exception and not at.error
     assert at.radio(key="div_lookback").value == "All"
     assert any(m.label == "Paid, all time" for m in at.metric)
+
+
+def test_buy_marker_renders_with_hover_details():
+    cal = _composite_calendar()
+    sym, col = cal.values.index[0], cal.values.columns[0]
+    marks = {sym: {col: [{"date": dt.date(2026, 1, 1), "quantity": 3.0, "price": 10.0,
+                          "cost": 30.0, "commission": 1.0, "currency": "USD", "fills": 1,
+                          "pos": 0.1, "holding": 7.456}]}}
+    html_doc = app._calendar_html(cal, dark=False, marks=marks)
+    assert html_doc.count('class="buy"') == 1
+    assert "Bought 3 sh</b> · 01-01-2026" in html_doc
+    assert "Price: 10.00 USD" in html_doc and "Cost: 30.00 USD" in html_doc
+    assert "Holding after: 7.46 sh" in html_doc
+    assert "Bought (hover for details)" in html_doc  # legend entry
+
+
+def test_ticker_label_shows_shares_held_now():
+    cal = _composite_calendar()
+    sym = cal.values.index[0]
+    cal.shares[sym] = 22.0
+    html_doc = app._calendar_html(cal, dark=False, marks={})
+    assert f'{sym} <span class="held" title="Shares held now">22 sh</span>' in html_doc

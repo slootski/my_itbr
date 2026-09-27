@@ -135,8 +135,18 @@ Implementation: `data/backup.py`, tests: `tests/test_backup.py`.
 
 ## Dividend calendar — how it works
 
-Rows are held tickers, columns are months ("Mon YYYY"), the current-month column
-is highlighted and always present. Cell **color encodes status, not value**:
+Rows are held tickers, then tickers you sold that paid (marked **sold**: past
+payments only, never projected). Columns are months ("Mon YYYY"); the
+current-month column is highlighted and always present.
+
+**One definition of dividend income.** `data/div_ledger.py` is the only code
+that turns cash transactions into dividend amounts. The calendar, the Net Worth
+dividend band, the Prices tab and the Positions heatmap all read from it, so
+they always show the same totals. Amounts are in base currency. After tax is
+the cash that landed: the dividend minus IBKR's withholding. When IBKR withheld
+nothing, after tax equals the gross amount; no tax rate is assumed.
+
+Cell **color encodes status, not value**:
 
 - **Green (paid)** — dividend actually received (Cash Transactions). Past months
   are paid-only: history is green or empty, never projected.

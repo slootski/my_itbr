@@ -386,7 +386,9 @@ def test_no_data_returns_empty():
     assert cal.empty
 
 
-def test_rows_restricted_to_held():
+def test_sold_ticker_keeps_its_paid_row():
+    # A ticker sold after it paid keeps its row, so the paid total matches every
+    # other screen. It is flagged ``sold`` and never projected.
     cash_tx = pd.DataFrame([
         {"type": "DIVIDEND", "symbol": "SOLD", "amount": 5.0,
          "settle_date": dt.date(2026, 1, 15), "ex_date": dt.date(2026, 1, 1),
@@ -394,12 +396,34 @@ def test_rows_restricted_to_held():
     ])
     cal = dividends.build_calendar(_positions("HELD"), cash_tx, pd.DataFrame(),
                                    today=dt.date(2026, 2, 1))
-    assert cal.empty  # SOLD not held, HELD alone has nothing to render
+    assert list(cal.values.index) == ["HELD", "SOLD"]  # sold rows last
+    assert cal.sold == {"SOLD"}
+    assert cal.no_data == {"HELD"}
+    assert cal.held_count == 1
+    assert cal.paid_sum == 5.0
+
+
+def test_sold_ticker_is_never_projected():
+    cash_tx = _quarterly_cash_tx()
+    cal = dividends.build_calendar(_positions("OTHER"), cash_tx, pd.DataFrame(),
+                                   today=dt.date(2026, 4, 1))
+    assert "ABC" in cal.sold
+    assert not {"declare", "pay"} & set(cal.status.loc["ABC"])
+
+
+def test_sold_ticker_with_only_a_stale_accrual_has_no_row():
+    accruals = pd.DataFrame([
+        {"symbol": "GONE", "ex_date": dt.date(2025, 6, 1), "pay_date": dt.date(2025, 6, 15),
+         "gross_amount": 10.0, "net_amount": 8.0, "quantity": 10, "tax": 2.0},
+    ])
+    cal = dividends.build_calendar(_positions("HELD"), pd.DataFrame(), accruals,
+                                   today=dt.date(2026, 2, 1))
+    assert cal.empty or "GONE" not in cal.values.index
 
 
 def test_held_without_data_gets_placeholder_row():
     # Held tickers with no dividend events still appear as (empty) rows,
-    # flagged in ``no_data``; data symbols not held stay excluded.
+    # flagged in ``no_data``; a sold ticker that paid keeps its own row.
     cash_tx = pd.DataFrame([
         {"type": "DIVIDEND", "symbol": "PAYER", "amount": 5.0,
          "settle_date": dt.date(2026, 1, 15), "ex_date": dt.date(2026, 1, 1),
@@ -410,11 +434,12 @@ def test_held_without_data_gets_placeholder_row():
     ])
     cal = dividends.build_calendar(_positions("PAYER", "NEWBUY"), cash_tx,
                                    pd.DataFrame(), today=dt.date(2026, 2, 1))
-    assert list(cal.values.index) == ["NEWBUY", "PAYER"]
+    assert list(cal.values.index) == ["NEWBUY", "PAYER", "SOLD"]
     assert cal.no_data == {"NEWBUY"}
+    assert cal.sold == {"SOLD"}
     assert (cal.values.loc["NEWBUY"] == "").all()
     assert (cal.status.loc["NEWBUY"] == "").all()
-    assert cal.paid_sum == 5.0  # SOLD excluded, NEWBUY contributes nothing
+    assert cal.paid_sum == 12.0  # PAYER 5 + SOLD 7; NEWBUY contributes nothing
 
 
 # ---- coverage() — statement-coverage detection (e3 B3) ---------------------
@@ -590,20 +615,20 @@ def test_polygon_declared_net_default_rate_no_history():
     assert "default 25% tax" in cal.tooltips.at["ABC", "2026-06"]
 
 
-def test_polygon_declared_net_default_rate_zero_withholding_history():
-    # Paid history with no WHTAX (ratio 1.0) must not pass gross through as
-    # net: the default rate applies, same as an IBKR zero-tax dividend.
+def test_polygon_declared_net_follows_zero_withholding_history():
+    # Paid history with no WHTAX (ratio 1.0): the estimate follows the real
+    # history, so net equals gross. The default rate is only for no history.
     positions = pd.DataFrame({"symbol": ["ABC"], "quantity": [100.0]})
     ext = {"ABC": {"ex_date": dt.date(2026, 5, 20), "pay_date": dt.date(2026, 6, 1),
                    "decl_date": dt.date(2026, 4, 15), "amount": 0.5, "currency": "USD"}}
     cal = dividends.build_calendar(positions, _quarterly_cash_tx(), pd.DataFrame(),
                                    today=dt.date(2026, 4, 1), net=True, external=ext)
-    assert cal.values.at["ABC", "2026-06"] == "≈37.50"
+    assert cal.values.at["ABC", "2026-06"] == "≈50.00"
 
 
-def test_zero_withholding_paid_uses_default_rate_after_tax():
-    # HAFN shape: IBKR posts a dividend with no WHTAX row. Before tax shows the
-    # full amount; after tax applies the default 25% instead of repeating gross.
+def test_zero_withholding_paid_is_real_cash_after_tax():
+    # HAFN shape: IBKR posts a dividend with no WHTAX row. After tax is the cash
+    # that landed, so it equals gross. No rate is assumed.
     cash_tx = pd.DataFrame([
         {"type": "PAYMENTINLIEU", "symbol": "HAFN", "amount": 3.88,
          "settle_date": dt.date(2026, 3, 13), "ex_date": dt.date(2026, 3, 6),
@@ -618,12 +643,12 @@ def test_zero_withholding_paid_uses_default_rate_after_tax():
                                    today=dt.date(2026, 9, 14), net=True)
     assert gross.values.at["HAFN", "2026-03"] == "3.88"
     assert gross.values.at["HAFN", "2026-06"] == "6.33"
-    assert net.values.at["HAFN", "2026-03"] == "2.91"
-    assert net.values.at["HAFN", "2026-06"] == "4.75"
-    assert net.paid_sum == pytest.approx((3.88 + 6.33) * 0.75)
+    assert net.values.at["HAFN", "2026-03"] == "3.88"
+    assert net.values.at["HAFN", "2026-06"] == "6.33"
+    assert net.paid_sum == pytest.approx(3.88 + 6.33)
 
 
-def test_zero_withholding_accrual_uses_default_rate_after_tax():
+def test_zero_withholding_accrual_is_ibkr_net_after_tax():
     # HAFN live accrual: grossAmount=11.01 netAmount=11.01 tax=0.
     accruals = pd.DataFrame([
         {"symbol": "HAFN", "ex_date": dt.date(2026, 9, 8), "pay_date": dt.date(2026, 9, 18),
@@ -634,7 +659,7 @@ def test_zero_withholding_accrual_uses_default_rate_after_tax():
     net = dividends.build_calendar(_positions("HAFN"), pd.DataFrame(), accruals,
                                    today=dt.date(2026, 9, 14), net=True)
     assert gross.values.at["HAFN", "2026-09"] == "11.01"
-    assert net.values.at["HAFN", "2026-09"] == "8.26"
+    assert net.values.at["HAFN", "2026-09"] == "11.01"
     assert net.totals["2026-09"] == ""  # declared, unpaid -> not summed
 
 
@@ -770,3 +795,104 @@ def test_external_empty_info_keeps_no_data_row():
     cal = dividends.build_calendar(_positions("ABC", "ZZZ"), cash_tx, pd.DataFrame(),
                                    today=dt.date(2026, 6, 12), external=ext)
     assert "ZZZ" in cal.no_data
+
+
+# ---- buy markers ------------------------------------------------------------
+
+def _trades(rows):
+    return pd.DataFrame([
+        {"symbol": s, "trade_date": d, "datetime": None, "side": side, "quantity": q,
+         "price": p, "proceeds": -q * p if side == "BUY" else q * p, "commission": -1.0,
+         "currency": "USD"}
+        for s, d, side, q, p in rows
+    ])
+
+
+def test_buy_marks_one_per_buy_day_in_its_month():
+    trades = _trades([
+        ("ABC", dt.date(2020, 1, 1), "BUY", 1.0, 10.0),
+        ("ABC", dt.date(2020, 2, 2), "BUY", 1.0, 20.0),
+        ("ABC", dt.date(2020, 2, 20), "SELL", 1.0, 25.0),   # sells are not marked
+        ("XYZ", dt.date(2020, 1, 5), "BUY", 1.0, 5.0),      # not a calendar row
+    ])
+    marks = dividends.buy_marks(trades=trades, symbols=["ABC"],
+                                columns=["2020-01", "2020-02"], shares={"ABC": 1.0})
+    assert set(marks) == {"ABC"}
+    jan, feb = marks["ABC"]["2020-01"], marks["ABC"]["2020-02"]
+    assert [(b["date"], b["price"], b["cost"]) for b in jan] == [(dt.date(2020, 1, 1), 10.0, 10.0)]
+    assert [(b["date"], b["price"]) for b in feb] == [(dt.date(2020, 2, 2), 20.0)]
+    assert 0 < jan[0]["pos"] < feb[0]["pos"] < 1  # day 1 sits left of day 2 of 29
+
+
+def test_buy_marks_merge_same_day_fills_with_average_price():
+    trades = _trades([
+        ("ABC", dt.date(2020, 1, 10), "BUY", 2.0, 10.0),
+        ("ABC", dt.date(2020, 1, 10), "BUY", 2.0, 12.0),
+    ])
+    (buy,) = dividends.buy_marks(trades=trades, symbols=["ABC"], columns=["2020-01"],
+                                  shares={"ABC": 4.0})["ABC"]["2020-01"]
+    assert (buy["quantity"], buy["price"], buy["cost"], buy["commission"], buy["fills"]) == (
+        4.0, 11.0, 44.0, 2.0, 2)
+
+
+def test_buy_marks_skip_months_outside_the_window():
+    trades = _trades([("ABC", dt.date(2019, 12, 31), "BUY", 1.0, 10.0)])
+    assert dividends.buy_marks(trades=trades, symbols=["ABC"], columns=["2020-01"],
+                               shares={"ABC": 1.0}) == {}
+
+
+def test_extend_back_adds_empty_months_and_keeps_totals():
+    cal = dividends.build_calendar(_positions("ABC"), _quarterly_cash_tx(), pd.DataFrame(),
+                                   today=dt.date(2026, 4, 1), net=False, lookback_months=None)
+    first = list(cal.values.columns)[0]
+    earlier = dividends._add_months(first, -2)
+    wide = dividends.extend_back(cal=cal, first_ym=earlier)
+    assert list(wide.values.columns)[:3] == [earlier, dividends._add_months(first, -1), first]
+    assert (wide.values[earlier] == "").all() and wide.totals[earlier] == ""
+    assert wide.paid_sum == cal.paid_sum
+    assert dividends.extend_back(cal=cal, first_ym=first) is cal
+
+
+def test_first_buy_month_ignores_sells_and_other_symbols():
+    trades = _trades([
+        ("ABC", dt.date(2020, 3, 1), "BUY", 1.0, 10.0),
+        ("ABC", dt.date(2020, 1, 1), "SELL", 1.0, 10.0),
+        ("XYZ", dt.date(2019, 1, 1), "BUY", 1.0, 10.0),
+    ])
+    assert dividends.first_buy_month(trades=trades, symbols=["ABC"]) == "2020-03"
+
+
+def test_buy_marks_holding_after_each_buy_counts_back_from_today():
+    # Held 1 share today: bought 1 (Jan), bought 1 (Feb 2), sold 1 (Feb 20).
+    trades = _trades([
+        ("ABC", dt.date(2020, 1, 1), "BUY", 1.0, 10.0),
+        ("ABC", dt.date(2020, 2, 2), "BUY", 1.0, 20.0),
+        ("ABC", dt.date(2020, 2, 20), "SELL", -1.0, 25.0),
+    ])
+    marks = dividends.buy_marks(trades=trades, symbols=["ABC"],
+                                columns=["2020-01", "2020-02"], shares={"ABC": 1.0})
+    assert marks["ABC"]["2020-01"][0]["holding"] == 1.0
+    assert marks["ABC"]["2020-02"][0]["holding"] == 2.0
+
+
+def test_buy_marks_sold_ticker_counts_back_from_zero():
+    trades = _trades([
+        ("GONE", dt.date(2020, 1, 1), "BUY", 3.0, 10.0),
+        ("GONE", dt.date(2020, 3, 1), "SELL", -3.0, 12.0),
+    ])
+    marks = dividends.buy_marks(trades=trades, symbols=["GONE"], columns=["2020-01"], shares={})
+    assert marks["GONE"]["2020-01"][0]["holding"] == 3.0
+
+
+@pytest.mark.parametrize(("value", "text"), [
+    (17.0, "17"), (2.5, "2.5"), (2.056, "2.06"), (0.444, "0.44"), (1234.5, "1,234.5"), (0.001, "0"),
+])
+def test_format_qty_two_decimals_at_most(value, text):
+    assert dividends.format_qty(value=value) == text
+
+
+def test_calendar_carries_current_shares():
+    positions = pd.DataFrame({"symbol": ["ABC"], "quantity": [12.3456]})
+    cal = dividends.build_calendar(positions, _quarterly_cash_tx(), pd.DataFrame(),
+                                   today=dt.date(2026, 4, 1))
+    assert cal.shares == {"ABC": 12.3456}

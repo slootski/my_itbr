@@ -6,8 +6,10 @@ IBKR; the sidebar Refresh button clears the cache to force a fresh pull.
 """
 from __future__ import annotations
 
+import datetime as dt
 import html
 import logging
+import uuid
 
 import pandas as pd
 import streamlit as st
@@ -18,7 +20,7 @@ from charts import figures
 from config import ENV_PATH, is_real_value, load_settings, save_env_values, validate_credentials
 from data import (
     backup, capital, div_external, div_provider, dividends, history, price_stats,
-    prices, snapshots,
+    prices, snapshots, sync,
 )
 from ibkr import flex, parser
 
@@ -34,37 +36,82 @@ settings = load_settings()
 
 # ---- data loading (cached) ------------------------------------------------
 
-@st.cache_data(show_spinner="Pulling from IBKR Flex…")
-def load_portfolio(token: str, query_id: str, db_path_str: str) -> dict:
-    """Download + parse a Flex statement and record a NAV snapshot.
+# One cache entry per browser session: a new session (app start, page reload)
+# pulls again, while widget reruns inside a session reuse the pull. Bounded so
+# old sessions' entries do not pile up in memory.
+_SESSION_KEY = "load_session"
+_MAX_CACHED_SESSIONS = 4
 
-    Cached by credentials, so this runs only on first load or after the cache is
-    cleared (Refresh). Returns plain DataFrames/dicts (serializable for caching).
+
+def session_key() -> str:
+    if _SESSION_KEY not in st.session_state:
+        st.session_state[_SESSION_KEY] = uuid.uuid4().hex
+    return st.session_state[_SESSION_KEY]
+
+
+def _pull(*, token: str, query_id: str) -> tuple[object, tuple[dt.date, dt.date] | None]:
+    """Pull everything IBKR still serves: the last MAX_WINDOW_DAYS days.
+
+    First the query's saved period. If that comes back shorter than the maximum
+    (the query was set to a shorter period), pull again with an explicit range
+    ending on the returned toDate — a date IBKR has data for. Ending on today or
+    a weekend instead gets error 1003.
     """
-    xml = flex.download_statement(token, query_id)
+    xml = flex.download_statement(token=token, query_id=query_id, date_range=None)
     stmt = parser.parse_statement(xml)
     if stmt is None:
         raise flex.FlexError("Flex statement contained no data. Check the query definition.")
 
+    from_date, to_date = getattr(stmt, "fromDate", None), getattr(stmt, "toDate", None)
+    if not (isinstance(from_date, dt.date) and isinstance(to_date, dt.date)):
+        return stmt, None
+    if (to_date - from_date).days + 1 >= flex.MAX_WINDOW_DAYS:
+        return stmt, None
+
+    requested = (to_date - dt.timedelta(days=flex.MAX_WINDOW_DAYS - 1), to_date)
+    logger.info(
+        "statement covers %s..%s only; pulling the full %d days",
+        from_date, to_date, flex.MAX_WINDOW_DAYS,
+    )
+    try:
+        wide = parser.parse_statement(
+            flex.download_statement(token=token, query_id=query_id, date_range=requested)
+        )
+    except flex.FlexError as exc:
+        # The short statement is still good data; keep it rather than fail the load.
+        logger.warning("full-window pull failed, keeping the query period: %s", exc)
+        return stmt, None
+    return (wide, requested) if wide is not None else (stmt, None)
+
+
+@st.cache_data(show_spinner="Pulling from IBKR Flex…", max_entries=_MAX_CACHED_SESSIONS)
+def load_portfolio(token: str, query_id: str, db_path_str: str, session: str) -> dict:
+    """Download + parse the full Flex window and sync it into the local store.
+
+    ``session`` only keys the cache: each browser session pulls once, and
+    Refresh clears the cache to pull again. Returns plain DataFrames/dicts
+    (serializable for caching).
+    """
+    stmt, requested = _pull(token=token, query_id=query_id)
+
     nav = parser.latest_nav(stmt)
     equity = parser.equity_summary_df(stmt)
-    # Record one snapshot per pull (deduped by date inside the store).
-    if nav.get("net_liq") is not None or nav.get("cash") is not None:
-        snapshots.record_snapshot(
-            db_path_str,
-            net_liq=nav.get("net_liq"),
-            cash=nav.get("cash"),
-            currency=nav.get("currency"),
-        )
-
     trades = parser.trades_df(stmt)
     cash_tx = parser.cash_transactions_df(stmt)
-    # The Flex window rolls forward (Last365CalendarDays), so trades and cash
-    # transactions age out of the statement and cannot be re-fetched afterwards.
-    # Archive them locally and serve the union, so history keeps growing past the
+    window = sync.make_window(
+        requested=requested,
+        returned_from=getattr(stmt, "fromDate", None),
+        returned_to=getattr(stmt, "toDate", None),
+    )
+    # The Flex window rolls forward, so trades and cash transactions age out of
+    # the statement and cannot be re-fetched afterwards. Sync adds only what the
+    # store is missing and serves the union, so history keeps growing past the
     # window. A store failure must never cost the user the live statement, so the
     # in-window frames stay the fallback.
-    trades, cash_tx = _archive_and_merge(db_path_str, trades, cash_tx, equity, nav)
+    trades, cash_tx, report = _sync_and_read(
+        db_path_str=db_path_str, trades=trades, cash_tx=cash_tx,
+        equity=equity, nav=nav, window=window,
+    )
 
     return {
         "account": parser.account_info(stmt),
@@ -75,46 +122,60 @@ def load_portfolio(token: str, query_id: str, db_path_str: str) -> dict:
         "cash_tx": cash_tx,
         "accruals": parser.dividend_accruals_df(stmt),
         "nav": nav,
+        "sync": report,
     }
 
 
-def _archive_and_merge(
+def _sync_and_read(
+    *,
     db_path_str: str,
     trades: pd.DataFrame,
     cash_tx: pd.DataFrame,
     equity: pd.DataFrame,
     nav: dict,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Fold this statement into the local archive and read the full history back.
+    window: dict,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+    """Find what the store is missing, write only that, read the full history back.
 
     Degrades to the statement's own frames on any store error — a broken archive
     should cost the user history, never the dashboard.
     """
+    now = dt.datetime.now()
+    empty = {"tables": {}, "window": window, "written": 0, "error": None}
     try:
-        n_trades = history.record_trades(db_path_str, trades)
-        n_cash = history.record_cash_tx(db_path_str, cash_tx)
-        n_nav = history.backfill_nav(db_path_str, equity, nav.get("currency"))
+        report = sync.plan(
+            db_path=db_path_str, trades=trades, cash_tx=cash_tx, equity=equity, nav=nav,
+            window=window, today=now.date().isoformat(),
+            now=now.isoformat(timespec="seconds"),
+        )
+    except Exception as exc:  # noqa: BLE001 — the check is best-effort by design
+        logger.exception("sync plan failed; falling back to the statement window only")
+        return trades, cash_tx, {**empty, "error": f"check failed: {exc}"}
+
+    if sync.pending(report=report):
+        # The store holds history IBKR can no longer re-serve, so back it up
+        # before writing. backup.run swallows its own failures.
+        backup.run(db_path_str, settings.backup_dir, keep=settings.backup_keep)
+        try:
+            report["written"] = sync.apply(
+                db_path=db_path_str, report=report, today=now.date().isoformat(),
+            )
+        except Exception as exc:  # noqa: BLE001 — rolled back; keep the dashboard
+            logger.exception("sync write failed; nothing was written")
+            report["error"] = f"write failed: {exc}"
+    sync.log_report(report=report)
+
+    try:
         archived_trades = history.read_trades(db_path_str)
         archived_cash = history.read_cash_tx(db_path_str)
-    except Exception:  # noqa: BLE001 — archiving is best-effort by design
-        logger.exception(
-            "history archive failed; falling back to the statement window only"
-        )
-        return trades, cash_tx
-
-    logger.info(
-        "history: folded %d trades / %d cash tx / backfilled %d NAV days; "
-        "archive now holds %d trades, %d cash tx",
-        n_trades, n_cash, n_nav, len(archived_trades), len(archived_cash),
-    )
-
-    # The store now holds history IBKR can no longer re-serve, so back it up once
-    # the fold has landed. backup.run swallows its own failures.
-    backup.run(db_path_str, settings.backup_dir, keep=settings.backup_keep)
+    except Exception:  # noqa: BLE001
+        logger.exception("history read failed; falling back to the statement window only")
+        return trades, cash_tx, report
     # An empty archive read (fresh DB that failed to write) must not blank a tab.
     return (
         archived_trades if not archived_trades.empty else trades,
         archived_cash if not archived_cash.empty else cash_tx,
+        report,
     )
 
 
@@ -499,6 +560,8 @@ _DIV_CSS = """
 .divcal-legend .sw-paid { background: var(--paid); box-shadow: inset 0 0 0 1px var(--paid-dot); }
 .divcal-legend .sw-declared { background: var(--declared); box-shadow: inset 0 0 0 1px var(--declared-dot); }
 .divcal-legend .sw-expected { outline: 1px dashed var(--expected); outline-offset: -1px; }
+.divcal-legend .sw-buy { width: 0; height: 0; background: none; border-left: 5px solid transparent;
+  border-right: 5px solid transparent; border-bottom: 8px solid var(--accent); border-radius: 0; }
 .divcal-legend .sw-current { background: var(--accent-tint); box-shadow: inset 2px 0 0 var(--accent), inset -2px 0 0 var(--accent); }
 
 /* Scrollable viewport: past ~70% of the screen the table scrolls, with month
@@ -528,6 +591,23 @@ _DIV_CSS = """
   outline: 1px dashed var(--expected); outline-offset: -6px; border-radius: 8px; }
 .divcal .nodata { color: var(--muted); font-style: italic; text-align: center; }
 
+/* Buy markers: a small triangle on the cell's bottom edge at the day of the
+   month the buy happened; hover opens a panel with the trade details. */
+.divcal tbody td { position: relative; }
+.divcal .buy { position: absolute; bottom: 2px; width: 10px; height: 8px; margin-left: -5px;
+  cursor: pointer; z-index: 4; }
+.divcal .buy::before { content: ""; position: absolute; left: 1px; bottom: 0; border-left: 4px solid transparent;
+  border-right: 4px solid transparent; border-bottom: 6px solid var(--accent); }
+.divcal .buytip { display: none; position: absolute; top: 10px; left: 50%; transform: translateX(-50%);
+  z-index: 20; min-width: 180px; padding: 8px 10px; border-radius: 8px; text-align: left; white-space: nowrap;
+  background: var(--surface-2); color: var(--ink); border: 1px solid var(--line-strong);
+  box-shadow: 0 6px 18px rgba(0,0,0,.25); font-size: 12px; font-weight: 400; line-height: 1.5; }
+.divcal .buytip b { font-weight: 650; }
+.divcal .buy:hover .buytip { display: block; }
+.divcal tr.sold th, .divcal tr.sold td { color: var(--muted); }
+.divcal .held { font-size: 11px; font-weight: 500; color: var(--muted); margin-left: 4px; }
+.divcal .soldtag { font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; margin-left: 4px; }
+
 .divcal th.tickertotal, .divcal td.tickertotal { font-weight: 700; border-right: 1px solid var(--line-strong); }
 .divcal tbody td.tickertotal { padding-bottom: 13px; background: linear-gradient(var(--bar), var(--bar)) no-repeat right 12px bottom 5px / calc((100% - 24px) * var(--pct, 0)) 3px; }
 
@@ -545,6 +625,7 @@ _DIV_LEGEND = (
     '<span><i class="sw-declared"></i>Declared, not paid yet</span>'
     '<span><i class="sw-expected"></i>Expected (estimated from history)</span>'
     '<span><i class="sw-current"></i>Current month</span>'
+    '<span><i class="sw-buy"></i>Bought (hover for details)</span>'
     "</div>"
 )
 
@@ -556,10 +637,45 @@ def _pct(total: str, top: float) -> str:
     return f"{float(total.replace(',', '')) / top:.3f}"
 
 
-def _calendar_html(cal: dividends.Calendar, dark: bool) -> str:
+def _money(*, value: float | None, currency: str | None) -> str:
+    if value is None:
+        return "—"
+    return f"{value:,.2f} {currency or ''}".strip()
+
+
+def _buy_marker(*, buy: dict) -> str:
+    """One buy triangle with its hover panel."""
+    qty = dividends.format_qty(value=buy["quantity"])
+    ccy = buy.get("currency")
+    details = [
+        f"Holding after: {dividends.format_qty(value=buy['holding'])} sh",
+        f"Price: {_money(value=buy['price'], currency=ccy)}",
+        f"Cost: {_money(value=buy['cost'], currency=ccy)}",
+        f"Commission: {_money(value=buy['commission'], currency=ccy)}",
+    ]
+    if buy["fills"] > 1:
+        details.append(f"{buy['fills']} fills (average price)")
+    head = f"<b>Bought {html.escape(qty)} sh</b> · {buy['date']:%d-%m-%Y}"
+    body = "<br>".join([head, *(html.escape(line) for line in details)])
+    return (f'<span class="buy" style="left:{100 * buy["pos"]:.1f}%">'
+            f'<span class="buytip">{body}</span></span>')
+
+
+def _ticker_label(*, cal: dividends.Calendar, sym: str) -> str:
+    """Ticker plus the shares held now, e.g. "HAFN 22 sh"."""
+    name = html.escape(str(sym))
+    qty = cal.shares.get(sym)
+    if qty is None:
+        return name
+    held = html.escape(dividends.format_qty(value=qty))
+    return f'{name} <span class="held" title="Shares held now">{held} sh</span>'
+
+
+def _calendar_html(cal: dividends.Calendar, dark: bool, marks: dict) -> str:
     """Render the calendar as an HTML table: status tints, current-month
     highlight, native hover tooltips (title), a per-ticker Total column with a
-    magnitude bar, and a Total footer row. ``dark`` follows the app theme."""
+    magnitude bar, and a Total footer row. ``dark`` follows the app theme.
+    ``marks`` (``dividends.buy_marks``) adds a hoverable triangle per buy."""
     cols = list(cal.values.columns)
     cur = cal.current_ym
     top = max(
@@ -578,7 +694,7 @@ def _calendar_html(cal: dividends.Calendar, dark: bool) -> str:
         total = f'<td class="tickertotal"{style}>{html.escape(tot)}</td>'
         if sym in cal.no_data:
             rows.append(
-                f'<tr><th>{html.escape(str(sym))}</th>{total}'
+                f'<tr><th>{_ticker_label(cal=cal, sym=sym)}</th>{total}'
                 f'<td class="nodata" colspan="{len(cols)}">— no dividends —</td></tr>'
             )
             continue
@@ -589,8 +705,15 @@ def _calendar_html(cal: dividends.Calendar, dark: bool) -> str:
                 klass = f"{klass} current".strip()
             tip = cal.tooltips.at[sym, c]
             title = f' title="{html.escape(tip)}"' if tip else ""
-            cells.append(f'<td class="{klass}"{title}>{html.escape(str(cal.values.at[sym, c]))}</td>')
-        rows.append(f'<tr><th>{html.escape(str(sym))}</th>{total}{"".join(cells)}</tr>')
+            buys = "".join(_buy_marker(buy=b) for b in marks.get(sym, {}).get(c, []))
+            cells.append(
+                f'<td class="{klass}"{title}>{html.escape(str(cal.values.at[sym, c]))}{buys}</td>'
+            )
+        if sym in cal.sold:
+            label = f'{html.escape(str(sym))} <span class="soldtag">sold</span>'
+            rows.append(f'<tr class="sold"><th>{label}</th>{total}{"".join(cells)}</tr>')
+        else:
+            rows.append(f'<tr><th>{_ticker_label(cal=cal, sym=sym)}</th>{total}{"".join(cells)}</tr>')
     foot = "".join(
         f'<td class="{"current" if c == cur else ""}">{html.escape(str(cal.totals[c]))}</td>'
         for c in cols
@@ -673,8 +796,7 @@ def tab_dividends(data: dict) -> None:
     # "All" = no window: everything since the first dividend on record.
     months = {"3M": 3, "6M": 6, "1Y": 12, "All": None}[lookback]
     st.caption(
-        f"Amounts after tax (IBKR withholding per ticker; "
-        f"{dividends.DEFAULT_TAX_RATE:.0%} where IBKR withheld nothing)."
+        "Amounts after tax: the cash that landed (dividend minus IBKR's withholding)."
         if net else "Amounts before withholding tax (gross)."
     )
 
@@ -727,7 +849,7 @@ def tab_dividends(data: dict) -> None:
     # Months elapsed in the window (first column .. current month) for the average.
     cols = list(cal.values.columns)
     elapsed = cols.index(cal.current_ym) + 1 if cal.current_ym in cols else len(cols)
-    paying = sum(1 for v in cal.ticker_totals if v)
+    paying = sum(1 for sym, v in cal.ticker_totals.items() if v and sym not in cal.sold)
     m1, m2, m3, m4 = st.columns(4)
     m1.metric(
         "Paid, all time" if months is None
@@ -739,13 +861,23 @@ def tab_dividends(data: dict) -> None:
               help=f"Paid total over {elapsed} month(s), current month included.")
     m3.metric("Declared, not paid yet", f"{cal.declared_sum:,.2f}", border=True,
               help="Announced amounts still to be paid. Not included in any paid total.")
-    m4.metric("Paying tickers", f"{paying} of {len(cal.values.index)}", border=True)
+    m4.metric("Paying tickers", f"{paying} of {cal.held_count}", border=True,
+              help="Held tickers that paid in the selected period. Sold tickers "
+                   "are listed below the calendar rows and counted in every total.")
 
-    st.html(_calendar_html(cal, dark=st.context.theme.type == "dark"))
+    # "All" reaches back to the first buy too, so every buy gets its marker.
+    first_buy = dividends.first_buy_month(trades=data.get("trades"), symbols=list(cal.values.index))
+    if months is None and first_buy is not None:
+        cal = dividends.extend_back(cal=cal, first_ym=first_buy)
+    marks = dividends.buy_marks(
+        trades=data.get("trades"), symbols=list(cal.values.index),
+        columns=list(cal.values.columns), shares=cal.shares,
+    )
+    st.html(_calendar_html(cal, dark=st.context.theme.type == "dark", marks=marks))
 
     with st.expander("How to read this calendar"):
         st.markdown(
-            "- **Rows** are held tickers, **columns** are months. **Total** "
+            "- **Rows** are held tickers (and sold tickers that paid), **columns** are months. **Total** "
             "(next to each ticker) sums what that ticker paid in the selected "
             "period; the bar under it compares tickers.\n"
             "- **Green** = paid. **Amber** = declared but not paid yet. "
@@ -758,7 +890,11 @@ def tab_dividends(data: dict) -> None:
             "not confirmed. IBKR data always wins; gaps are filled from Polygon "
             "(declared amounts) and yfinance (dates only), and the tooltip shows "
             "the source.\n"
-            "- “No dividends” rows are held tickers that pay none."
+            "- “No dividends” rows are held tickers that pay none.\n"
+            "- Rows marked **sold** are tickers you no longer hold. Their past "
+            "payments count in every total; nothing is projected for them.\n"
+            "- After tax is the cash that landed: the dividend minus IBKR's "
+            "withholding. The same numbers feed Net Worth, Prices and Positions."
         )
 
 
@@ -1032,6 +1168,72 @@ def render_net_worth_or_hint() -> None:
     tab_net_worth()
 
 
+# ---- DB sync report ---------------------------------------------------------
+
+def _sync_headline(*, report: dict) -> tuple[str, str]:
+    """(level, text) for the sidebar line: success / warning / error."""
+    if report["error"]:
+        return "error", f"DB sync: {report['error']}"
+    diffs = sync.differences(report=report)
+    added = report["written"]
+    text = f"DB sync: added {added:,}" if added else "DB sync: up to date"
+    if diffs:
+        return "warning", f"{text}, {diffs:,} differences"
+    return "success", text
+
+
+def render_sync_status(*, report: dict) -> None:
+    level, text = _sync_headline(report=report)
+    getattr(st.sidebar, level)(text)
+
+
+def _sync_rows(*, items: list[dict], extra: list[str]) -> pd.DataFrame:
+    # Extra columns mix text, dates and numbers across rows; as text they render
+    # in one Arrow column.
+    cols = ["date", "symbol", "type", "amount", *extra]
+    rows = [
+        {c: (str(item.get(c)) if c in extra else item.get(c)) for c in cols} for item in items
+    ]
+    return pd.DataFrame(rows, columns=cols)
+
+
+def render_sync_details(*, report: dict) -> None:
+    """What IBKR had that the DB was missing, what was written, what disagrees."""
+    with st.expander("DB sync details"):
+        window = report["window"]
+        requested = (
+            f"{window['requested_from']} → {window['requested_to']}"
+            if window["requested_from"] else "query period"
+        )
+        st.caption(
+            f"IBKR window: {window['returned_from'] or '—'} → {window['returned_to'] or '—'} "
+            f"({window['days'] or '—'} days; requested: {requested}). "
+            f"Written this load: {report['written']:,}."
+        )
+        if report["error"]:
+            st.error(report["error"])
+        if not report["tables"]:
+            return
+        summary = pd.DataFrame([
+            {"table": name, "missing (added)": len(part["missing"]),
+             "empty fields (filled)": len(part["fills"]), "differences (kept DB)": len(part["diffs"])}
+            for name, part in report["tables"].items()
+        ])
+        st.dataframe(summary, width="stretch", hide_index=True)
+        for name, part in report["tables"].items():
+            if part["missing"]:
+                st.markdown(f"**{name}: rows added**")
+                st.dataframe(_sync_rows(items=part["missing"], extra=[]), width="stretch", hide_index=True)
+            if part["fills"]:
+                st.markdown(f"**{name}: empty fields filled**")
+                st.dataframe(_sync_rows(items=part["fills"], extra=["column", "value"]),
+                             width="stretch", hide_index=True)
+            if part["diffs"]:
+                st.markdown(f"**{name}: IBKR differs from DB (DB value kept)**")
+                st.dataframe(_sync_rows(items=part["diffs"], extra=["column", "db", "ibkr"]),
+                             width="stretch", hide_index=True)
+
+
 # ---- main -----------------------------------------------------------------
 
 def main() -> None:
@@ -1048,7 +1250,10 @@ def main() -> None:
         return
 
     try:
-        data = load_portfolio(settings.flex_token, settings.flex_query_id, str(settings.db_path))
+        data = load_portfolio(
+            token=settings.flex_token, query_id=settings.flex_query_id,
+            db_path_str=str(settings.db_path), session=session_key(),
+        )
     except flex.FlexError as exc:
         if exc.code in flex.TOKEN_ERROR_CODES:
             sidebar_status.error(f"IBKR: {_SIDEBAR_TOKEN_STATUS[exc.code]}")
@@ -1064,10 +1269,12 @@ def main() -> None:
             st.info("Fix the token/query in `.env`, then click **Refresh data**.")
         # Net Worth still works from prior snapshots — keep the history reachable
         # while the credential is being fixed.
+        st.sidebar.caption("DB sync: not checked (pull failed)")
         render_net_worth_or_hint()
         return
 
     sidebar_status.success("IBKR: connected")
+    render_sync_status(report=data["sync"])
     overview, positions, trades, price, divs, net_worth = st.tabs(
         ["Overview", "Positions", "Trades", "Prices", "Dividends", "Net Worth"]
     )
@@ -1083,6 +1290,7 @@ def main() -> None:
         tab_dividends(data)
     with net_worth:
         tab_net_worth(data.get("cash_tx"))
+        render_sync_details(report=data["sync"])
 
 
 if __name__ == "__main__":

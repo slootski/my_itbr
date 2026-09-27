@@ -20,12 +20,9 @@ import logging
 
 import pandas as pd
 
-logger = logging.getLogger("myitbr.price_stats")
+from data import div_ledger
 
-# Same classification the dividend calendar uses, so both views agree on what
-# counts as dividend income vs withholding tax.
-_DIVIDEND_TYPES = {"DIVIDEND", "PAYMENTINLIEU"}
-_WHTAX_TYPE = "WHTAX"
+logger = logging.getLogger("myitbr.price_stats")
 
 # Trading days per year, for annualizing the daily-return standard deviation.
 _TRADING_DAYS = 252
@@ -91,68 +88,19 @@ def _atr(ohlc: pd.DataFrame, window: int = _ATR_WINDOW) -> float | None:
 
 
 def dividends_received(cash_tx: pd.DataFrame, symbol: str) -> dict:
-    """Everything IBKR has paid me on ``symbol``, over the whole statement.
+    """Everything IBKR has paid me on ``symbol``, from the shared dividend ledger.
 
-    ``gross`` sums DIVIDEND + PAYMENTINLIEU; ``net`` folds in WHTAX (which is
-    posted as a negative amount). ``last_amount``/``last_date`` describe the
-    most recent payment, and ``ttm_gross`` covers the trailing 12 months (the
-    basis for the yield-on-price figure).
-
-    Note this is the *whole* Flex statement's history — how far back that goes
-    depends on the Flex query's date range, not on this function.
+    ``gross`` sums DIVIDEND + PAYMENTINLIEU; ``net`` is the cash that landed
+    (withholding folded in). ``last_amount``/``last_date`` describe the most
+    recent payment, and ``ttm_gross`` covers the trailing 12 months (the basis
+    for the yield-on-price figure). Same figures as the Dividends tab.
     """
-    out = {
-        "gross": None, "net": None, "count": 0,
-        "last_amount": None, "last_date": None, "ttm_gross": None,
-        "first_date": None,
-    }
-    if cash_tx is None or cash_tx.empty or "symbol" not in cash_tx or not symbol:
-        return out
-
-    rows = cash_tx[cash_tx["symbol"].astype(str) == str(symbol)]
-    if rows.empty:
-        return out
-
-    gross = net = 0.0
-    ttm = 0.0
-    dates: list[dt.date] = []
-    last_date: dt.date | None = None
-    last_amount: float | None = None
-    count = 0
-    cutoff = dt.date.today() - dt.timedelta(days=365)
-
-    for _, row in rows.iterrows():
-        amount = _f(row.get("amount"))
-        if amount is None:
-            continue
-        kind = row.get("type")
-        # Prefer the settlement date; fall back the same way the calendar does.
-        paid_on = (_to_date(row.get("settle_date"))
-                   or _to_date(row.get("datetime"))
-                   or _to_date(row.get("report_date")))
-        if kind in _DIVIDEND_TYPES:
-            gross += amount
-            net += amount
-            count += 1
-            if paid_on is not None:
-                dates.append(paid_on)
-                if last_date is None or paid_on >= last_date:
-                    last_date, last_amount = paid_on, amount
-                if paid_on >= cutoff:
-                    ttm += amount
-        elif kind == _WHTAX_TYPE:
-            net += amount
-
-    if count == 0 and net == 0.0:
-        return out
-
-    out.update({
-        "gross": gross, "net": net, "count": count,
-        "last_amount": last_amount, "last_date": last_date,
-        "ttm_gross": ttm if ttm else None,
-        "first_date": min(dates) if dates else None,
-    })
-    return out
+    ledger, _ = div_ledger.events(cash_tx=cash_tx)
+    if not symbol:
+        ledger = ledger.iloc[0:0]
+    return div_ledger.for_symbol(
+        ledger=ledger, symbol=symbol, ttm_start=dt.date.today() - dt.timedelta(days=365),
+    )
 
 
 def _position_row(positions: pd.DataFrame, symbol: str) -> pd.Series | None:

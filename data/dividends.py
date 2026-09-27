@@ -3,7 +3,8 @@
 Turns IBKR paid dividends (cash transactions) and declared-but-unpaid dividends
 (open accruals) into a per-ticker / per-month grid the Dividends tab renders.
 
-Rows are held tickers; columns are chronological months. Each cell carries a
+Rows are held tickers plus tickers sold since they paid (``sold`` — past
+payments only, never projected); columns are chronological months. Each cell carries a
 status that drives its colour (status, not value):
 
   - ``paid``     (green)  — actual dividend received.        amount shown.
@@ -26,9 +27,11 @@ horizon).
 Past months are paid-only: declared accruals render in their payment month,
 current month or later — a stale accrual never rewrites history.
 
-Net amounts: declared/paid use the real Flex net (paid net folds in WHTAX, which
-is negative). When IBKR withheld nothing (net equals gross), ``DEFAULT_TAX_RATE``
-is applied instead, so after-tax never shows an untaxed gross figure. Red cells
+Paid amounts come from ``data.div_ledger`` — the one definition of dividend
+income every screen shares. After tax is the cash that actually landed (gross
+plus IBKR's withholding); when IBKR withheld nothing it equals gross. Declared
+accruals use IBKR's own net. Only an external (Polygon) amount for a ticker with
+no paid history uses ``DEFAULT_TAX_RATE``, marked as an estimate. Red cells
 carry no amount, so tax mode does not affect them.
 
 Tickers with no Flex events at all can optionally be backfilled from an
@@ -49,14 +52,13 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 
+from data import div_ledger
+
 logger = logging.getLogger("myitbr.dividends")
 
-# Cash-transaction types that are dividend income (positive) vs withholding tax.
-_DIVIDEND_TYPES = {"DIVIDEND", "PAYMENTINLIEU"}
-_WHTAX_TYPE = "WHTAX"
-# Tax rate for after-tax mode when IBKR withheld nothing on a dividend (e.g.
-# HAFN, a Singapore issuer with 0% withholding), and for external (Polygon)
-# amounts with no real withholding history to derive a rate from.
+# Estimated tax rate for an external (Polygon) declared amount on a ticker with
+# no paid history to derive its real withholding from. Never applied to money
+# IBKR paid or declared.
 DEFAULT_TAX_RATE = 0.25
 # Minimum number of distinct paid months needed to infer a cadence to project.
 _MIN_PAID_FOR_PROJECTION = 2
@@ -85,7 +87,11 @@ class Calendar:
     ending at (and including) the current month. ``no_data`` lists held tickers
     with no dividend events at all (their rows are empty placeholders).
     ``projected`` lists tickers carrying a red projected (declare/pay) cell —
-    the ones an external declared-amount lookup can still upgrade.
+    the ones an external declared-amount lookup can still upgrade. ``sold``
+    lists rows for tickers no longer held that IBKR paid or still owes: their
+    payments count in every total, but they are never projected. ``held_count`` is the
+    number of held tickers (rows minus ``sold``). ``shares`` is the quantity held
+    now per held ticker (sold tickers are absent).
     """
     values: pd.DataFrame
     status: pd.DataFrame
@@ -93,6 +99,9 @@ class Calendar:
     current_ym: str
     ticker_totals: pd.Series
     declared_sum: float
+    sold: set[str]
+    held_count: int
+    shares: dict[str, float]
     totals: pd.Series = field(default_factory=lambda: pd.Series(dtype=object))
     paid_sum: float = 0.0
     no_data: set[str] = field(default_factory=set)
@@ -178,66 +187,21 @@ def _shares_by_symbol(positions_df: pd.DataFrame) -> dict[str, float]:
 
 def _pay_date_of_tx(row) -> dt.date | None:
     """Payment date for a cash transaction: prefer settle, then datetime/report."""
-    return (
-        _to_date(row.get("settle_date"))
-        or _to_date(row.get("datetime"))
-        or _to_date(row.get("report_date"))
-    )
+    return div_ledger.pay_date(row=row)
 
 
 # ---- aggregation ----------------------------------------------------------
 
+def _paid_events(cash_tx: pd.DataFrame) -> pd.DataFrame:
+    """Dividend payments from the shared ledger (only rows that paid income)."""
+    ledger, _ = div_ledger.events(cash_tx=cash_tx)
+    return ledger[ledger["payments"] > 0] if not ledger.empty else ledger
+
+
 def _paid_by_symbol_month(cash_tx: pd.DataFrame) -> dict[str, dict[str, dict]]:
-    """Per symbol -> {ym: {gross, net}} for actually-paid dividends.
-
-    Gross sums DIVIDEND + PAYMENTINLIEU; net folds in WHTAX (negative) for the
-    same symbol+month.
-    """
-    out: dict[str, dict[str, dict]] = {}
-    if cash_tx is None or cash_tx.empty:
-        return out
-
-    # Pass 1: place dividend income in its payment month, and remember which
-    # month each (symbol, ex_date) landed in so the matching WHTAX can follow it.
-    div_month: dict[tuple[str, dt.date | None], str] = {}
-    for _, row in cash_tx.iterrows():
-        sym = row.get("symbol")
-        if not sym or row.get("type") not in _DIVIDEND_TYPES:
-            continue
-        amount = row.get("amount")
-        if amount is None or pd.isna(amount):
-            continue
-        pay = _pay_date_of_tx(row)
-        if pay is None:
-            continue
-        ym = _ym(pay)
-        cell = out.setdefault(str(sym), {}).setdefault(ym, {"gross": 0.0, "net": 0.0})
-        cell["gross"] += float(amount)
-        cell["net"] += float(amount)
-        div_month[(str(sym), _to_date(row.get("ex_date")))] = ym
-
-    # Pass 2: fold withholding tax (negative) into the matching dividend's month
-    # via (symbol, ex_date). IBKR may post WHTAX in a different month/settle-date
-    # than the dividend it offsets; keying off the WHTAX row's own date splits net
-    # across months (dividend month shows gross-as-net, tax month shows a negative
-    # phantom cell). Fall back to the WHTAX row's own month for orphan tax with no
-    # matching dividend, so it is never silently dropped.
-    for _, row in cash_tx.iterrows():
-        sym = row.get("symbol")
-        if not sym or row.get("type") != _WHTAX_TYPE:
-            continue
-        amount = row.get("amount")
-        if amount is None or pd.isna(amount):
-            continue
-        ym = div_month.get((str(sym), _to_date(row.get("ex_date"))))
-        if ym is None:
-            pay = _pay_date_of_tx(row)
-            if pay is None:
-                continue
-            ym = _ym(pay)
-        cell = out.setdefault(str(sym), {}).setdefault(ym, {"gross": 0.0, "net": 0.0})
-        cell["net"] += float(amount)
-    return out
+    """Per symbol -> {ym: {gross, net}} for actually-paid dividends (ledger)."""
+    ledger, _ = div_ledger.events(cash_tx=cash_tx)
+    return div_ledger.by_symbol_month(ledger=ledger)
 
 
 def _declared_by_symbol(accruals: pd.DataFrame) -> dict[str, dict[str, dict]]:
@@ -262,8 +226,14 @@ def _declared_by_symbol(accruals: pd.DataFrame) -> dict[str, dict[str, dict]]:
             continue
         gross = row.get("gross_amount")
         net = row.get("net_amount")
+        tax = row.get("tax")
         gross = float(gross) if gross is not None and not pd.isna(gross) else None
         net = float(net) if net is not None and not pd.isna(net) else None
+        tax = float(tax) if tax is not None and not pd.isna(tax) else None
+        # IBKR's own net; when only gross and tax are given, gross minus tax
+        # (accrual tax is posted as a positive amount).
+        if net is None and gross is not None and tax is not None:
+            net = gross - abs(tax)
         cell = out.setdefault(str(sym), {}).setdefault(
             _ym(pay), {"gross": None, "net": None, "events": []}
         )
@@ -309,15 +279,8 @@ def _pay_gap_days(cash_tx: pd.DataFrame) -> dict[str, tuple[int, dt.date]]:
     or late payment can't masquerade as a fast cadence.
     """
     dates: dict[str, set[dt.date]] = {}
-    if cash_tx is None or cash_tx.empty:
-        return {}
-    for _, row in cash_tx.iterrows():
-        if row.get("type") not in _DIVIDEND_TYPES:
-            continue
-        sym = row.get("symbol")
-        pay = _pay_date_of_tx(row)
-        if sym and pay:
-            dates.setdefault(str(sym), set()).add(pay)
+    for event in _paid_events(cash_tx).to_dict("records"):
+        dates.setdefault(event["symbol"], set()).add(event["pay_date"])
     out: dict[str, tuple[int, dt.date]] = {}
     for sym, ds in dates.items():
         ordered = sorted(ds)
@@ -333,16 +296,12 @@ def _pay_gap_days(cash_tx: pd.DataFrame) -> dict[str, tuple[int, dt.date]]:
 def _decl_to_pay_offset(cash_tx: pd.DataFrame) -> dict[str, int]:
     """Per symbol, the typical month gap between ex-date and payment (paid divs)."""
     gaps: dict[str, list[int]] = {}
-    if cash_tx is None or cash_tx.empty:
-        return {}
-    for _, row in cash_tx.iterrows():
-        if row.get("type") not in _DIVIDEND_TYPES:
+    for event in _paid_events(cash_tx).to_dict("records"):
+        ex = _to_date(event["ex_date"])
+        if ex is None:
             continue
-        ex = _to_date(row.get("ex_date"))
-        pay = _pay_date_of_tx(row)
-        if not row.get("symbol") or ex is None or pay is None:
-            continue
-        gaps.setdefault(str(row["symbol"]), []).append(_idx(_ym(pay)) - _idx(_ym(ex)))
+        gaps.setdefault(event["symbol"], []).append(
+            _idx(_ym(event["pay_date"])) - _idx(_ym(ex)))
     return {sym: (_mode(g) or 0) for sym, g in gaps.items()}
 
 
@@ -358,18 +317,12 @@ def _typical_days(cash_tx: pd.DataFrame) -> tuple[dict[str, int], dict[str, int]
     """
     ex_days: dict[str, list[int]] = {}
     pay_days: dict[str, list[int]] = {}
-    if cash_tx is None or cash_tx.empty:
-        return {}, {}
-    for _, row in cash_tx.iterrows():
-        sym = row.get("symbol")
-        if not sym or row.get("type") not in _DIVIDEND_TYPES:
-            continue
-        ex = _to_date(row.get("ex_date"))
-        pay = _pay_date_of_tx(row)
+    for event in _paid_events(cash_tx).to_dict("records"):
+        sym = event["symbol"]
+        ex = _to_date(event["ex_date"])
         if ex is not None:
-            ex_days.setdefault(str(sym), []).append(ex.day)
-        if pay is not None:
-            pay_days.setdefault(str(sym), []).append(pay.day)
+            ex_days.setdefault(sym, []).append(ex.day)
+        pay_days.setdefault(sym, []).append(event["pay_date"].day)
 
     def _median(days: list[int]) -> int:
         ordered = sorted(days)
@@ -541,8 +494,8 @@ def _polygon_declared_by_symbol(
     Polygon reports gross, so the gross (before-tax) cell carries the exact cash
     figure. The net (after-tax) cell is an ESTIMATE (marked ``approx``): gross
     scaled by the symbol's historical net/gross withholding ratio, or by
-    ``1 - DEFAULT_TAX_RATE`` when no paid history exists or that history shows no
-    withholding. Shorts / zero holdings are skipped.
+    ``1 - DEFAULT_TAX_RATE`` only when no paid history exists. A history with no
+    withholding gives ratio 1 (net = gross). Shorts / zero holdings are skipped.
     """
     net_ratios = net_ratios or {}
     out: dict[str, dict[str, dict]] = {}
@@ -564,7 +517,7 @@ def _polygon_declared_by_symbol(
         if net:
             approx = True
             ratio = net_ratios.get(sym)
-            if ratio is not None and ratio < 1:
+            if ratio is not None:
                 value = amount * qty * ratio
                 tip = (
                     f"declared {amount:g}/sh x {qty:g} sh{decl_line}"
@@ -620,15 +573,13 @@ def coverage(cash_tx_df: pd.DataFrame | None) -> dict:
 
 
 def _amount(cell: dict, net: bool) -> float | None:
+    """IBKR's own figure: gross, or net (cash that lands). No rate is assumed —
+    when IBKR withheld nothing, net is gross."""
     gross = cell.get("gross")
     if not net:
         return gross
     val = cell.get("net")
-    # IBKR withheld nothing (no WHTAX row / accrual tax=0): apply the default
-    # rate rather than showing the untaxed gross as the after-tax figure.
-    if gross is not None and gross > 0 and (val is None or val >= gross):
-        return gross * (1 - DEFAULT_TAX_RATE)
-    return val
+    return gross if val is None else val
 
 
 def _fmt(value: float | None) -> str:
@@ -679,9 +630,17 @@ def build_calendar(
 
     held = _held_symbols(positions_df)
     data_symbols = set(paid) | set(declared)
-    # Rows are ALL held tickers (no-data ones become placeholder rows); if
-    # there are no open positions, every ticker that has dividend data.
-    symbols = sorted(held) if held else sorted(data_symbols)
+    # Rows are ALL held tickers (no-data ones become placeholder rows) plus every
+    # sold ticker that paid, so the paid total matches every other screen. With
+    # no open positions, every ticker that has dividend data.
+    if held:
+        # A ticker sold after its ex-date still gets paid, so an open accrual
+        # keeps a sold row too.
+        sold = data_symbols - held
+        symbols = sorted(held) + sorted(sold)  # sold rows go last
+    else:
+        sold = set()
+        symbols = sorted(data_symbols)
 
     # Real declared amounts (Polygon) for tickers Flex has no accrual on — a
     # confirmed declaration that, like a Flex accrual, suppresses the red guess.
@@ -710,6 +669,8 @@ def build_calendar(
             events[sym][ym] = {
                 "status": "declared", "value": _amount(cell, net), "tip": _accrual_tip(cell),
             }
+        if sym in sold:  # no longer held: IBKR data only, never projected
+            continue
         # 2b) external declared (Polygon, yellow) — fills any held ticker lacking
         #     a Flex accrual; never overrides real Flex data (paid/declared).
         for ym, cell in poly_declared.get(sym, {}).items():
@@ -765,9 +726,12 @@ def build_calendar(
     #    Flex and Polygon produced nothing.
     if external:
         for sym in symbols:
-            if not events[sym] and external.get(sym):
+            if sym not in sold and not events[sym] and external.get(sym):
                 _apply_external(events[sym], external[sym], current_ym)
 
+    # A sold ticker whose only data is a stale past accrual has nothing to show.
+    symbols = [s for s in symbols if s not in sold or events[s]]
+    sold = {s for s in sold if s in symbols}
     no_data = {s for s in symbols if not events[s]}
     projected = {
         s for s in symbols
@@ -783,6 +747,7 @@ def build_calendar(
         return Calendar(
             values=empty, status=empty, tooltips=empty, current_ym=current_ym,
             ticker_totals=pd.Series(dtype=object), declared_sum=0.0,
+            sold=set(), held_count=len(held), shares=shares,
         )
 
     # Columns: trailing lookback window (or full history) through the last event,
@@ -859,7 +824,148 @@ def build_calendar(
     return Calendar(
         values=values, status=status, tooltips=tooltips,
         current_ym=current_ym, ticker_totals=ticker_totals,
-        declared_sum=float(declared_sum), totals=totals,
+        declared_sum=float(declared_sum), sold=sold, held_count=len(held) or len(symbols),
+        shares=shares,
+        totals=totals,
         paid_sum=float(paid_sum),
         no_data=no_data, projected=projected,
+    )
+
+
+# ---- buy markers ----------------------------------------------------------
+
+def _num(*, value) -> float | None:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def format_qty(*, value: float) -> str:
+    """Share count with at most two decimals: 17 -> "17", 2.5 -> "2.5", 2.056 -> "2.06"."""
+    text = f"{value:,.2f}".rstrip("0").rstrip(".")
+    return "0" if text in ("-0", "") else text
+
+
+def _holding_after(
+    *, trades: pd.DataFrame, symbol: str, date: dt.date, current: float,
+) -> float:
+    """Shares held at the end of ``date``: today's holding minus every later trade.
+
+    Counting back from today's IBKR position (rather than forward from the first
+    archived trade) stays right even when the trade archive does not reach back
+    to the first buy. Sell quantities are negative in Flex.
+    """
+    later = 0.0
+    for row in trades.to_dict("records"):
+        if str(row.get("symbol")) != symbol:
+            continue
+        when = _to_date(row.get("trade_date")) or _to_date(row.get("datetime"))
+        qty = _num(value=row.get("quantity"))
+        if when is not None and when > date and qty is not None:
+            later += qty
+    return current - later
+
+
+def buy_marks(
+    *, trades: pd.DataFrame | None, symbols: list[str], columns: list[str],
+    shares: dict[str, float],
+) -> dict[str, dict[str, list[dict]]]:
+    """symbol -> {"YYYY-MM": [buy]} for the calendar's rows and month columns.
+
+    Fills of the same symbol on the same day are one buy: quantities, cost and
+    commission are summed and the price is the quantity-weighted average. Each
+    buy carries ``pos`` (0..1), where its day falls within the month, so the
+    marker sits at that point of the cell's timeline, and ``holding`` — shares
+    held at the end of that day, counted back from ``shares`` (held now; a
+    ticker absent from it is held at 0).
+    """
+    out: dict[str, dict[str, list[dict]]] = {}
+    if trades is None or trades.empty or "side" not in trades or "symbol" not in trades:
+        return out
+    wanted, colset = set(symbols), set(columns)
+    days: dict[tuple[str, dt.date], dict] = {}
+    for row in trades.to_dict("records"):
+        if str(row.get("side")).upper() != "BUY":
+            continue
+        sym = row.get("symbol")
+        date = _to_date(row.get("trade_date")) or _to_date(row.get("datetime"))
+        qty = _num(value=row.get("quantity"))
+        if not sym or str(sym) not in wanted or date is None or not qty:
+            continue
+        if _ym(date) not in colset:
+            continue
+        price = _num(value=row.get("price"))
+        proceeds = _num(value=row.get("proceeds"))
+        buy = days.setdefault((str(sym), date), {
+            "date": date, "quantity": 0.0, "cost": 0.0, "commission": 0.0,
+            "currency": row.get("currency"), "fills": 0, "_value": 0.0,
+        })
+        qty = abs(qty)
+        buy["quantity"] += qty
+        buy["fills"] += 1
+        if proceeds is not None:
+            buy["cost"] += abs(proceeds)
+        elif price is not None:
+            buy["cost"] += qty * price
+        if price is not None:
+            buy["_value"] += qty * price
+        commission = _num(value=row.get("commission"))
+        if commission is not None:
+            buy["commission"] += abs(commission)
+
+    for (sym, date), buy in sorted(days.items(), key=lambda item: item[0][1]):
+        value = buy.pop("_value")
+        buy["price"] = value / buy["quantity"] if value else None
+        last_day = _calendar.monthrange(date.year, date.month)[1]
+        buy["pos"] = (date.day - 0.5) / last_day
+        buy["holding"] = _holding_after(trades=trades, symbol=sym, date=date,
+                                        current=shares.get(sym, 0.0))
+        out.setdefault(sym, {}).setdefault(_ym(date), []).append(buy)
+    return out
+
+
+def first_buy_month(*, trades: pd.DataFrame | None, symbols: list[str]) -> str | None:
+    """Earliest ``YYYY-MM`` with a buy of any calendar row, or None."""
+    if trades is None or trades.empty or "side" not in trades or "symbol" not in trades:
+        return None
+    wanted = set(symbols)
+    months = [
+        _ym(date)
+        for row in trades.to_dict("records")
+        if str(row.get("side")).upper() == "BUY" and str(row.get("symbol")) in wanted
+        for date in [_to_date(row.get("trade_date")) or _to_date(row.get("datetime"))]
+        if date is not None
+    ]
+    return min(months) if months else None
+
+
+def extend_back(*, cal: Calendar, first_ym: str) -> Calendar:
+    """Prepend empty month columns so the calendar starts at ``first_ym``.
+
+    Used for the "All" view, so buys made before the first dividend still get
+    their markers. Adds no money: new columns are empty and totals unchanged.
+    """
+    if cal.empty:
+        return cal
+    columns = list(cal.values.columns)
+    if first_ym >= columns[0]:
+        return cal
+    new = [_ym_from_idx(i) for i in range(_idx(first_ym), _idx(columns[0]))]
+
+    def widen(df: pd.DataFrame) -> pd.DataFrame:
+        pad = pd.DataFrame("", index=df.index, columns=new)
+        out = pd.concat([pad, df], axis=1)
+        out.index.name = df.index.name
+        return out
+
+    totals = pd.concat([pd.Series("", index=new, dtype=object), cal.totals])
+    return Calendar(
+        values=widen(cal.values), status=widen(cal.status), tooltips=widen(cal.tooltips),
+        current_ym=cal.current_ym, ticker_totals=cal.ticker_totals,
+        declared_sum=cal.declared_sum, sold=cal.sold, held_count=cal.held_count,
+        shares=cal.shares,
+        totals=totals, paid_sum=cal.paid_sum, no_data=cal.no_data, projected=cal.projected,
     )

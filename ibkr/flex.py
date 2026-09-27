@@ -17,6 +17,7 @@ outer retry for those transport-level errors.
 """
 from __future__ import annotations
 
+import datetime as dt
 import logging
 import time
 
@@ -45,6 +46,13 @@ TOKEN_EXPIRED = "1012"
 TOKEN_INVALID = "1015"
 TOKEN_ERROR_CODES = (TOKEN_EXPIRED, TOKEN_INVALID)
 
+# The longest window a Flex statement can cover. Anything older ages out of IBKR
+# for good, which is why data/history.py archives it locally.
+MAX_WINDOW_DAYS = 365
+
+# GetStatement polls for an explicit-range request (ibflex's own download uses 5).
+MAX_POLLS = 10
+
 
 class FlexError(Exception):
     """Raised when a Flex download fails for any reason.
@@ -71,8 +79,56 @@ def _scrub(text: object, token: str) -> str:
         return "<unprintable error>"
 
 
-def download_statement(token: str, query_id: str) -> bytes:
+def _fetch_range(*, token: str, query_id: str, date_range: tuple[dt.date, dt.date]) -> bytes:
+    """Run the request/poll cycle for an explicit ``fd``/``td`` date range.
+
+    ``ibflex.client.download`` cannot pass extra SendRequest parameters, so this
+    mirrors it with ibflex's own building blocks. IBKR answers 1003 ("Statement is
+    not available") when ``td`` has no data yet (a weekend or today), so callers
+    must end the range on a date IBKR has already served.
+    """
+    from_date, to_date = date_range
+    response = requests.get(
+        flex_client.REQUEST_URL,
+        params={
+            "v": "3", "t": token, "q": query_id,
+            "fd": from_date.strftime("%Y%m%d"), "td": to_date.strftime("%Y%m%d"),
+        },
+        headers={"user-agent": "Java"},
+        timeout=30,
+    )
+    access = flex_client.parse_stmt_response(response)
+    if isinstance(access, flex_client.StatementError):
+        raise ResponseCodeError(access.ErrorCode, access.ErrorMessage)
+
+    delay: bool | int = 0
+    for _ in range(MAX_POLLS):
+        time.sleep(delay)
+        statement = flex_client.submit_request(
+            url=access.Url or flex_client.STMT_URL, token=token, query=access.ReferenceCode,
+        )
+        delay = flex_client.check_statement_response(statement)
+        if delay is True:
+            return statement.content
+    raise flex_client.StatementGenerationTimeout(
+        f"Statement not ready after {MAX_POLLS} polls"
+    )
+
+
+def _fetch(*, token: str, query_id: str, date_range: tuple[dt.date, dt.date] | None) -> bytes:
+    """One request/poll cycle: the query's own period, or ``date_range`` when given."""
+    if date_range is None:
+        return flex_client.download(token, query_id)
+    return _fetch_range(token=token, query_id=query_id, date_range=date_range)
+
+
+def download_statement(
+    token: str, query_id: str, date_range: tuple[dt.date, dt.date] | None
+) -> bytes:
     """Run the full Flex request/poll cycle and return raw statement XML bytes.
+
+    ``date_range`` is ``None`` for the period saved in the Flex Query, or an
+    inclusive ``(from, to)`` pair that overrides it (at most MAX_WINDOW_DAYS).
 
     Raises:
         FlexError: with a human-readable message on any failure.
@@ -83,11 +139,15 @@ def download_statement(token: str, query_id: str) -> bytes:
     # Log the query id only — NEVER the token. Polling/backoff (SendRequest ->
     # GetStatement retries) happens inside ibflex.client.download and is not
     # separately observable here; we log the overall outcome and duration.
-    logger.info("download_statement start (query_id=%s)", query_id)
+    logger.info(
+        "download_statement start (query_id=%s, range=%s)",
+        query_id, "query period" if date_range is None
+        else f"{date_range[0].isoformat()}..{date_range[1].isoformat()}",
+    )
     started = time.monotonic()
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            payload = flex_client.download(token, query_id)
+            payload = _fetch(token=token, query_id=query_id, date_range=date_range)
             break
         except ResponseCodeError as exc:
             # IBKR returned an error status (e.g. 1003 invalid token, 1018 invalid

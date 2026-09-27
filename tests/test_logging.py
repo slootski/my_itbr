@@ -96,7 +96,7 @@ def test_flex_logs_query_id_never_token(caplog, monkeypatch):
     token = "SECRET-TOKEN-123456"
     monkeypatch.setattr(flex.flex_client, "download", lambda t, q: b"<xml/>")
     with caplog.at_level(logging.DEBUG, logger="myitbr.flex"):
-        flex.download_statement(token, "qid42")
+        flex.download_statement(token=token, query_id="qid42", date_range=None)
     records = [r for r in caplog.records if r.name == "myitbr.flex"]
     assert records, "download_statement emitted no log records"
     joined = " ".join(r.getMessage() for r in records)
@@ -114,7 +114,7 @@ def test_flex_failure_log_scrubs_token(caplog, monkeypatch):
     monkeypatch.setattr(flex.flex_client, "download", _boom)
     with caplog.at_level(logging.DEBUG, logger="myitbr.flex"):
         with pytest.raises(flex.FlexError):
-            flex.download_statement(token, "qid42")
+            flex.download_statement(token=token, query_id="qid42", date_range=None)
     joined = " ".join(
         r.getMessage() for r in caplog.records if r.name == "myitbr.flex"
     )

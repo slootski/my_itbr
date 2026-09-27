@@ -52,7 +52,7 @@ def smoke_app(monkeypatch, tmp_path):
 
     download_calls: list[tuple[str, str]] = []
 
-    def fake_download(token: str, query_id: str) -> bytes:
+    def fake_download(token: str, query_id: str, date_range: tuple | None) -> bytes:
         download_calls.append((token, query_id))
         return SYNTHETIC_FLEX_XML
 
@@ -167,7 +167,7 @@ def _wire_app(monkeypatch, tmp_path, download) -> AppTest:
 def test_coverage_banner_shows_for_short_statement(monkeypatch, tmp_path):
     """F1a: 1-day cash-tx coverage -> warning with day count, range, IBKR path."""
     xml = _xml_with_short_cash_tx()
-    at = _wire_app(monkeypatch, tmp_path, lambda token, query_id: xml)
+    at = _wire_app(monkeypatch, tmp_path, lambda token, query_id, date_range: xml)
     at.run()
     st.cache_data.clear()
 
@@ -209,7 +209,7 @@ def test_refresh_preserves_dividend_widget_state_and_refetches(monkeypatch, tmp_
     """
     download_calls: list[tuple[str, str]] = []
 
-    def fake_download(token: str, query_id: str) -> bytes:
+    def fake_download(token: str, query_id: str, date_range: tuple | None) -> bytes:
         download_calls.append((token, query_id))
         return SYNTHETIC_FLEX_XML
 
@@ -258,7 +258,7 @@ def test_refresh_retains_basis_and_lookback_together(monkeypatch, tmp_path):
     """
     download_calls: list[tuple[str, str]] = []
 
-    def fake_download(token: str, query_id: str) -> bytes:
+    def fake_download(token: str, query_id: str, date_range: tuple | None) -> bytes:
         download_calls.append((token, query_id))
         return SYNTHETIC_FLEX_XML
 
@@ -299,7 +299,7 @@ def test_flex_error_display_scrubs_token(monkeypatch, tmp_path):
     request URL) must reach st.error with the token replaced by ***."""
     from ibkr import flex
 
-    def boom(token: str, query_id: str) -> bytes:
+    def boom(token: str, query_id: str, date_range: tuple | None) -> bytes:
         raise flex.FlexError(
             f"could not reach https://gdcdyn.interactivebrokers.com/"
             f"SendRequest?t={token}&q={query_id}&v=3"
@@ -406,7 +406,7 @@ def test_net_worth_dividend_split_toggle(smoke_app):
 # ---- token expiry (IBKR Flex 1012 / 1015) ---------------------------------
 
 def _flex_code_boom(code: str, message: str):
-    def boom(token: str, query_id: str) -> bytes:
+    def boom(token: str, query_id: str, date_range: tuple | None) -> bytes:
         raise flex_mod.FlexError(f"IBKR Flex error {code}: {message}", code=code)
     return boom
 
@@ -454,7 +454,7 @@ def _wire_missing_credentials(monkeypatch, tmp_path, env_path):
     monkeypatch.setenv("DB_PATH", str(tmp_path / "key-snapshots.sqlite"))
     calls: list[tuple[str, str]] = []
 
-    def fake_download(token: str, query_id: str) -> bytes:
+    def fake_download(token: str, query_id: str, date_range: tuple | None) -> bytes:
         calls.append((token, query_id))
         return SYNTHETIC_FLEX_XML
 
@@ -579,3 +579,69 @@ def test_dialog_cancel_closes_without_writing(monkeypatch, tmp_path):
     assert "connect_dialog_open" not in at.session_state
     assert "your_flex_token_here" in env_path.read_text()
     assert calls == []
+
+
+# ---- full-window pull + DB sync -----------------------------------------------
+
+def test_full_window_pulls_once_and_reports_sync(monkeypatch, tmp_path):
+    calls: list[tuple | None] = []
+
+    def fake_download(token: str, query_id: str, date_range: tuple | None) -> bytes:
+        calls.append(date_range)
+        return SYNTHETIC_FLEX_XML
+
+    at = _wire_app(monkeypatch, tmp_path, fake_download)
+    try:
+        at.run()
+        assert not at.exception, f"app raised: {[e.value for e in at.exception]}"
+        # Synthetic statement already spans 366 days: no second, ranged pull.
+        assert calls == [None]
+        sidebar = [s.value for s in at.sidebar.success]
+        assert any(v.startswith("DB sync: added") for v in sidebar), sidebar
+        assert any(e.label == "DB sync details" for e in at.expander)
+
+        # Same data again in a new session: nothing missing, nothing written.
+        st.cache_data.clear()
+        again = AppTest.from_file(str(APP_PATH), default_timeout=30)
+        again.run()
+        assert not again.exception
+        assert "DB sync: up to date" in [s.value for s in again.sidebar.success]
+    finally:
+        st.cache_data.clear()
+
+
+def test_short_query_period_is_repulled_with_full_range(monkeypatch, tmp_path):
+    short = SYNTHETIC_FLEX_XML.replace(b'fromDate="2024-01-01"', b'fromDate="2024-12-01"')
+    calls: list[tuple | None] = []
+
+    def fake_download(token: str, query_id: str, date_range: tuple | None) -> bytes:
+        calls.append(date_range)
+        return short if date_range is None else SYNTHETIC_FLEX_XML
+
+    at = _wire_app(monkeypatch, tmp_path, fake_download)
+    try:
+        at.run()
+        assert not at.exception, f"app raised: {[e.value for e in at.exception]}"
+        assert calls[0] is None
+        assert calls[1] == (dt.date(2024, 1, 2), dt.date(2024, 12, 31))  # 365 days to toDate
+        assert len(calls) == 2
+    finally:
+        st.cache_data.clear()
+
+
+def test_each_new_session_pulls_again(monkeypatch, tmp_path):
+    calls: list[tuple | None] = []
+
+    def fake_download(token: str, query_id: str, date_range: tuple | None) -> bytes:
+        calls.append(date_range)
+        return SYNTHETIC_FLEX_XML
+
+    at = _wire_app(monkeypatch, tmp_path, fake_download)
+    try:
+        at.run()
+        at.run()  # widget-style rerun in the same session: cached
+        assert len(calls) == 1
+        AppTest.from_file(str(APP_PATH), default_timeout=30).run()  # new session
+        assert len(calls) == 2
+    finally:
+        st.cache_data.clear()

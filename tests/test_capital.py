@@ -22,7 +22,7 @@ def deposits():
          "settle_date": dt.date(2026, 1, 5)},
         {"type": "DEPOSITWITHDRAW", "amount": 350.0, "amount_base": 350.0,
          "settle_date": dt.date(2026, 3, 1)},
-        {"type": "DIVIDEND", "amount": 9.0, "amount_base": 9.0,
+        {"type": "DIVIDEND", "symbol": "ABC", "amount": 9.0, "amount_base": 9.0,
          "settle_date": dt.date(2026, 3, 5)},
     ])
 
@@ -124,9 +124,9 @@ def test_clip_preserves_cumulative_contributions_across_the_boundary(nav, deposi
 @pytest.fixture
 def income_tx(deposits):
     return pd.concat([deposits, _tx([
-        {"type": "PAYMENTINLIEU", "amount": 4.0, "amount_base": 4.0,
+        {"type": "PAYMENTINLIEU", "symbol": "XYZ", "amount": 4.0, "amount_base": 4.0,
          "settle_date": dt.date(2026, 4, 10)},
-        {"type": "WHTAX", "amount": -3.0, "amount_base": -3.0,
+        {"type": "WHTAX", "symbol": "ABC", "amount": -3.0, "amount_base": -3.0,
          "settle_date": dt.date(2026, 3, 5)},
         {"type": "BROKERINTRCVD", "amount": 2.0, "amount_base": 2.0,
          "settle_date": dt.date(2026, 3, 6)},
