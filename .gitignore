@@ -13,6 +13,10 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
 # Runtime logs
 logs/
@@ -21,3 +25,13 @@ logs/
 .idea/
 .vscode/
 .DS_Store
+
+# Claude Code local state
+.claude/
+
+# Browser check screenshots
+screenshots/
+
+# Working prompts not kept in the repo (the other prompt* files are tracked)
+prompt.sync
+prompt.watchlist
