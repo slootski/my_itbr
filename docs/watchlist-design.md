@@ -1417,3 +1417,19 @@ Run in Chrome against a scratch copy of the database.
   marks it; a user sort keeps the mark (D22).
 - Later the same day, on the user's request: an empty list also shows **Edit / move /
   remove**, disabled and plain, next to **＋ Add stock**.
+
+### Change — 2026-10-13 — list menu and quiet update buttons (on the user's request)
+
+Replaces the five boxed buttons in 3.3 (the user chose it from three mock-ups):
+
+```
+List [ Quantum (1 alert)             ▾] [▲] [▼]              [ List actions ▾ ]
+Prices fetched 10:02 · updates: only when I open the app   ↻ Update now  ◷ Update schedule
+```
+
+- **List actions** is a popover with **New list**, **Rename <list>**, **Delete <list>**
+  (F1-F3 gain one click). Opening a dialog closes it.
+- **Update now** and **Update schedule** are borderless text buttons at the right of the
+  status line.
+- The state with no lists (3.1) keeps its single **＋ New list** button.
+- Not checked in the browser.

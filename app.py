@@ -728,6 +728,7 @@ _WL_SYMBOL = "wl_symbol"
 # Column widths of the stock buttons' row: Add stock, Edit / move / remove, the rest.
 _WL_STOCK_ROW = [1.2, 2.4, 5]
 _WL_DIALOG = "wl_dialog"
+_WL_LIST_MENU = "wl_list_menu"
 _QUOTE_WORKERS = 6
 
 _WL_READ_ERROR = "The watchlist could not be read from the database."
@@ -858,6 +859,8 @@ def _open_watchlist_dialog(*, kind: str, payload: dict) -> None:
     """Button callback: remember which dialog is open and give its fields their
     start values (a keyed field shows its key's value, not ``value=``)."""
     _close_watchlist_dialog()
+    # The dialog replaces the list menu it may have been opened from.
+    st.session_state[_WL_LIST_MENU] = False
     st.session_state[_WL_DIALOG] = {"kind": kind, **payload}
     for key, value in watchlist.dialog_state(kind=kind, payload=payload).items():
         st.session_state[key] = value
@@ -1341,8 +1344,7 @@ def _watchlist_body(
     picker_css = _list_picker_css(lists=len(ids), options=len(options))
     if picker_css:
         st.html(picker_css)
-    pick, up, down, new, rename, delete = st.columns(
-        [5, 0.4, 0.4, 1.2, 1, 1], vertical_alignment="bottom")
+    pick, up, down, _, menu_col = st.columns([5, 0.4, 0.4, 1.8, 1.4], vertical_alignment="bottom")
     pick.selectbox("List", options, format_func=option_label, key=_WL_PICKER_KEY,
                    on_change=_pick_watchlist, placeholder="Search a list or a ticker",
                    help="Opens on your lists. Type to search your lists and watched tickers.")
@@ -1353,32 +1355,38 @@ def _watchlist_body(
         down.button("▼", key="wl_list_next", help="Next list", disabled=position == len(ids) - 1,
                     on_click=_step_watchlist, kwargs={"ids": ids, "step": 1}, width="stretch")
     list_items = items[items["list_id"] == list_id]
-    new.button("＋ New list", key="wl_new_list", on_click=_open_watchlist_dialog,
-               kwargs={"kind": "new_list", "payload": {}}, width="stretch")
-    rename.button("Rename", key="wl_rename_list", on_click=_open_watchlist_dialog,
-                  kwargs={"kind": "rename_list", "payload": {"list_id": list_id, "name": list_name}},
-                  width="stretch")
-    delete.button("Delete", key="wl_delete_list", on_click=_open_watchlist_dialog,
-                  kwargs={"kind": "delete_list", "payload": {
-                      "list_id": list_id, "name": list_name,
-                      "symbols": list(list_items["symbol"])}},
-                  width="stretch")
+    # One menu for the three list actions: they are rare, and Delete is not one
+    # stray click away. It tracks its state so that a dialog can close it.
+    menu = menu_col.popover("List actions", key=_WL_LIST_MENU, on_change="rerun", width="stretch")
+    menu.button("New list", key="wl_new_list", icon=":material/add:", type="tertiary",
+                on_click=_open_watchlist_dialog, kwargs={"kind": "new_list", "payload": {}})
+    menu.button(f"Rename {list_name}", key="wl_rename_list", icon=":material/edit:", type="tertiary",
+                on_click=_open_watchlist_dialog,
+                kwargs={"kind": "rename_list", "payload": {"list_id": list_id, "name": list_name}})
+    menu.button(f"Delete {list_name}", key="wl_delete_list", icon=":material/delete:", type="tertiary",
+                on_click=_open_watchlist_dialog,
+                kwargs={"kind": "delete_list", "payload": {
+                    "list_id": list_id, "name": list_name,
+                    "symbols": list(list_items["symbol"])}})
 
     if not items.empty:
         setting, now = state["setting"], state["now"]
         active = watchlist.is_active(setting=setting, now=now)
         label_text = watchlist.refresh_label(setting=setting, now=now, tz=watchlist.local_tz())
-        line, update, schedule = st.columns([6, 1.2, 1.6], vertical_alignment="center")
+        line, links_col = st.columns([3, 2], vertical_alignment="center")
+        # Quiet text buttons: the status line stays a line, not a second toolbar.
+        links = links_col.container(horizontal=True, horizontal_alignment="right")
         fetched = f"Prices fetched {_fetched_text(state=state)}" if state["fetched"] else "Prices not fetched"
         line.caption(f"{fetched} · updates: {label_text}"
                      + (" · works only while this page is open" if active else ""))
-        update.button("Update now", key="wl_update_now", on_click=_update_quotes_now, width="stretch")
-        schedule.button("Update schedule", key="wl_schedule", on_click=_open_watchlist_dialog,
-                        kwargs={"kind": "schedule", "payload": {
-                            "label": label_text, "watched": len(items),
-                            "interval_minutes": setting["interval_minutes"] if active else None,
-                            "until": setting["until"] if active else None}},
-                        width="stretch")
+        links.button("Update now", key="wl_update_now", icon=":material/refresh:", type="tertiary",
+                     on_click=_update_quotes_now)
+        links.button("Update schedule", key="wl_schedule", icon=":material/schedule:", type="tertiary",
+                     on_click=_open_watchlist_dialog,
+                     kwargs={"kind": "schedule", "payload": {
+                         "label": label_text, "watched": len(items),
+                         "interval_minutes": setting["interval_minutes"] if active else None,
+                         "until": setting["until"] if active else None}})
         elsewhere = [f"{names[other]} ({_alert_count(count=count)})"
                      for other, count in found["by_list"].items() if other != list_id and other in names]
         if elsewhere:

@@ -507,6 +507,19 @@ def test_the_list_box_searches_lists_and_tickers(watch):
     assert at.button(key="wl_edit_stock").label == "Edit / move / remove: QTUM"
 
 
+def test_list_actions_are_one_menu_and_update_actions_are_quiet(two_lists):
+    watch, _ = two_lists
+    at = watch.at
+    assert [b.label for b in (at.button(key=k) for k in ("wl_new_list", "wl_rename_list", "wl_delete_list"))] == [
+        "New list", "Rename Quantum", "Delete Quantum"]
+    quiet = ("wl_new_list", "wl_rename_list", "wl_delete_list", "wl_update_now", "wl_schedule")
+    assert {at.button(key=key).proto.type for key in quiet} == {"tertiary"}
+    at.session_state["wl_list_menu"] = True                    # the menu is open
+    at = watch.click("wl_rename_list")
+    assert at.session_state["wl_list_menu"] is False           # the dialog closed it
+    assert at.text_input(key="wl_dlg_name").value == "Quantum"
+
+
 def test_list_arrows_are_hidden_with_one_list(watch):
     watch.seed(lists={"Only": []})
     watch.run()
