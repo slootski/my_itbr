@@ -268,7 +268,7 @@ def _fmt_money(v, ccy: str | None) -> str:
 
 
 def tab_overview(data: dict, *, watch_state: dict) -> None:
-    _render_watchlist_alerts(state=watch_state)
+    _render_watchlist_alerts(state=watch_state, tab_key=_TABS_MAIN)
     account, nav = data["account"], data["nav"]
     st.subheader("Account")
     cols = st.columns(2)
@@ -728,6 +728,8 @@ _WL_SYMBOL = "wl_symbol"
 # Column widths of the stock buttons' row: Add stock, Edit / move / remove, the rest.
 _WL_STOCK_ROW = [1.2, 2.4, 5]
 _WL_DIALOG = "wl_dialog"
+# The main tabs track their state, so a button can open a tab (the alert box's link, the bell).
+_TABS_MAIN = "tabs_main"
 _WL_LIST_MENU = "wl_list_menu"
 _QUOTE_WORKERS = 6
 
@@ -762,7 +764,7 @@ def _watchlist_state() -> dict:
     now = watchlist.utc_now()
     if "wl_nonce" not in st.session_state:
         st.session_state["wl_nonce"] = 0
-    state = {"now": now, "error": None, "quotes": {}, "fetched": None}
+    state = {"now": now, "error": None, "quotes": {}, "fetched": None, "mutes": {}}
     try:
         watchlist.init_db(db_path=settings.db_path)
     except Exception:  # noqa: BLE001 — a broken watchlist must not cost the other tabs
@@ -774,6 +776,7 @@ def _watchlist_state() -> dict:
         state["error"] = _WL_READ_ERROR
     state["lists"], state["items"] = lists["lists"], items["items"]
     state["setting"] = watchlist.read_refresh(db_path=settings.db_path)
+    state["mutes"] = watchlist.read_mutes(db_path=settings.db_path, now=now)
     state["bucket"] = watchlist.quote_bucket(
         setting=state["setting"], now=now, session=session_key(),
         nonce=st.session_state["wl_nonce"],
@@ -827,8 +830,66 @@ _WL_ALERT_CSS = """
 """
 
 
-def _render_watchlist_alerts(*, state: dict) -> None:
-    """The box at the top of Overview: every stock at its buy or sell target."""
+def _alert_lines(*, state: dict) -> dict:
+    """The reached targets of this run, split into shown and hidden ones."""
+    if state["error"] is not None or state["items"].empty:
+        return {"shown": [], "hidden": []}
+    found = watchlist.alerts(items=state["items"], quotes=state["quotes"])
+    return watchlist.visible_alerts(lines=found["lines"], mutes=state["mutes"])
+
+
+def _open_alert_stock(*, symbol: str, list_id: int, tab_key: str | None) -> None:
+    """Button callback: open the Watchlist tab on the alert's list and stock."""
+    st.session_state[_WL_LIST] = list_id
+    st.session_state[_WL_SYMBOL] = symbol
+    if tab_key is not None:
+        st.session_state[tab_key] = "Watchlist"
+
+
+def _open_overview() -> None:
+    st.session_state[_TABS_MAIN] = "Overview"
+
+
+def _mute_alert(*, symbol: str, side: str, kind: str) -> None:
+    """Button callback: hide one alert for an hour or until tomorrow."""
+    now, tz = watchlist.utc_now(), watchlist.local_tz()
+    until = watchlist.mute_until(kind=kind, now=now, tz=tz)
+    error = _save_watchlist(action=lambda: watchlist.write_mute(
+        db_path=settings.db_path, symbol=symbol, side=side, until=until, now=now))
+    if error is not None:
+        st.session_state["wl_toast"] = error
+    elif kind == watchlist.MUTE_TODAY:
+        st.session_state["wl_toast"] = f"{symbol} alert hidden until tomorrow."
+    else:
+        st.session_state["wl_toast"] = (
+            f"{symbol} alert hidden until {watchlist.until_label(until=until, now=now, tz=tz)}.")
+
+
+def _show_hidden_alerts() -> None:
+    error = _save_watchlist(action=lambda: watchlist.clear_mutes(db_path=settings.db_path))
+    if error is not None:
+        st.session_state["wl_toast"] = error
+
+
+def _render_hidden_alerts(*, hidden: list[dict], state: dict) -> None:
+    """One quiet line for the alerts the user hid, with the way to get them back."""
+    if not hidden:
+        return
+    tz = watchlist.local_tz()
+    parts = [f"{line['symbol']} until {watchlist.until_label(until=line['until'], now=state['now'], tz=tz)}"
+             for line in hidden]
+    row = st.container(horizontal=True, vertical_alignment="center")
+    row.caption(f"Hidden: {', '.join(parts)}.")
+    row.button("Show hidden alerts", key="wl_alert_show_hidden", type="tertiary",
+               icon=":material/visibility:", on_click=_show_hidden_alerts)
+
+
+def _render_watchlist_alerts(*, state: dict, tab_key: str | None) -> None:
+    """The box at the top of Overview: every stock at its buy or sell target.
+
+    ``tab_key`` is the key of the tabs that hold a Watchlist tab to open, or None
+    when the Watchlist is already the first tab.
+    """
     # The slot always exists, so the box coming and going cannot shift the tabs' identity.
     slot = st.container()
     if state["error"] is not None:
@@ -846,24 +907,43 @@ def _render_watchlist_alerts(*, state: dict) -> None:
             st.write("Watchlist prices could not be fetched. Targets were not checked. "
                      "Open the Watchlist tab and click Update now.")
         return
-    if not found["lines"] and not found["missing"]:
+    split = watchlist.visible_alerts(lines=found["lines"], mutes=state["mutes"])
+    shown, hidden = split["shown"], split["hidden"]
+    if not shown and not found["missing"]:
+        with slot:
+            _render_hidden_alerts(hidden=hidden, state=state)
         return
-    count = len(found["lines"])
-    if count:
+    if shown:
         slot.html(_WL_ALERT_CSS)
     # Only a reached price gets the loud box; a missing price stays a plain one.
-    with slot.container(border=True, key="wl_alert_box" if count else "wl_prices_box"):
+    with slot.container(border=True, key="wl_alert_box" if shown else "wl_prices_box"):
         # No title on the alerts: each line says what it is.
-        if not count:
+        if not shown:
             st.markdown("**Watchlist prices**")
-        for line in found["lines"]:
-            buy = line["side"] == "buy"
+        for line in shown:
+            symbol, side = line["symbol"], line["side"]
+            buy = side == "buy"
             badge = ":green-badge[BUY]" if buy else ":red-badge[SELL]"
-            st.markdown(
-                f":material/notifications_active: {badge} **{line['symbol']}** {_fmt_money(line['price'], line['currency'])} is at or "
+            text, actions = st.columns([3, 2], vertical_alignment="center")
+            text.markdown(
+                f":material/notifications_active: {badge} **{symbol}** "
+                f"{_fmt_money(line['price'], line['currency'])} is at or "
                 f"{'below' if buy else 'above'} your {'Buy below' if buy else 'Sell above'} price "
                 f"{_fmt_price(line['target'])} · {line['list_name']}"
             )
+            row = actions.container(horizontal=True, horizontal_alignment="right")
+            row.button("Open in Watchlist", key=f"wl_alert_open_{symbol}_{side}", type="tertiary",
+                       icon=":material/open_in_new:", help="See the chart and figures, and edit it",
+                       on_click=_open_alert_stock,
+                       kwargs={"symbol": symbol, "list_id": int(line["list_id"]), "tab_key": tab_key})
+            row.button("Snooze 1 hour", key=f"wl_alert_snooze_{symbol}_{side}", type="tertiary",
+                       icon=":material/snooze:", help="Hide this alert; it comes back in one hour",
+                       on_click=_mute_alert,
+                       kwargs={"symbol": symbol, "side": side, "kind": watchlist.MUTE_HOUR})
+            row.button("Hide for today", key=f"wl_alert_today_{symbol}_{side}", type="tertiary",
+                       icon=":material/notifications_off:", help="Hide this alert until tomorrow",
+                       on_click=_mute_alert,
+                       kwargs={"symbol": symbol, "side": side, "kind": watchlist.MUTE_TODAY})
         if found["missing"]:
             many = len(found["missing"]) > 1
             st.write(f"No price for: {', '.join(found['missing'])}. "
@@ -871,6 +951,39 @@ def _render_watchlist_alerts(*, state: dict) -> None:
         if state["fetched"] is not None:
             st.caption(f"Fetched {_fetched_text(state=state)}. Quotes may be delayed (about 15 "
                        "minutes on most exchanges). See the Watchlist tab.")
+        _render_hidden_alerts(hidden=hidden, state=state)
+
+
+# The bell at the top right rings while an alert is shown and the user is on another tab.
+_WL_BELL_CSS = """
+<style>
+@keyframes wl-ring {
+  0%, 55%, 100% { transform: rotate(0); }
+  8% { transform: rotate(20deg); } 16% { transform: rotate(-18deg); }
+  24% { transform: rotate(14deg); } 32% { transform: rotate(-10deg); }
+  40% { transform: rotate(6deg); } 48% { transform: rotate(-3deg); }
+}
+.st-key-wl_bell button { color: #d99a0e; font-weight: 700; }
+.st-key-wl_bell button [data-testid="stIconMaterial"] {
+  font-size: 1.9rem; transform-origin: 50% 10%; animation: wl-ring 1.6s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .st-key-wl_bell button [data-testid="stIconMaterial"] { animation: none; }
+}
+</style>
+"""
+
+
+def _render_alert_bell(*, slot, state: dict) -> None:
+    """A ringing bell at the top right that opens Overview, where the alert box is."""
+    count = len(_alert_lines(state=state)["shown"])
+    on_overview = _TABS_MAIN not in st.session_state or st.session_state[_TABS_MAIN] == "Overview"
+    if not count or on_overview:
+        return
+    slot.html(_WL_BELL_CSS)
+    slot.button(str(count), key="wl_bell", type="tertiary", icon=":material/notifications_active:",
+                help=f"{_alert_count(count=count)} on your watchlist. Click to open Overview.",
+                on_click=_open_overview)
 
 
 # -- dialogs: one at a time, opened by a flag and closed by callbacks ---------
@@ -2673,7 +2786,9 @@ def _render_offline_tabs(*, watch_state: dict) -> None:
 
 def main() -> None:
     sidebar_status = render_sidebar()
-    st.title("📈 IBKR Dashboard")
+    head, bell_col = st.columns([8, 1], vertical_alignment="center")
+    head.title("📈 IBKR Dashboard")
+    bell_slot = bell_col.container(horizontal=True, horizontal_alignment="right")
     if _CONNECT_SAVED in st.session_state:
         del st.session_state[_CONNECT_SAVED]
         st.success("Connected to IBKR.")
@@ -2694,7 +2809,7 @@ def main() -> None:
             del st.session_state[_FLEX_FAILED]
         _close_perf_day()
         sidebar_status.warning("IBKR: not connected")
-        _render_watchlist_alerts(state=watch_state)
+        _render_watchlist_alerts(state=watch_state, tab_key=None)
         render_connect_card(code=None, query_id_missing=not is_real_value(settings.flex_query_id))
         st.caption("Save a token above to connect.")
         _render_offline_tabs(watch_state=watch_state)
@@ -2717,7 +2832,7 @@ def main() -> None:
     if data is None:
         failed = st.session_state[_FLEX_FAILED]
         _close_perf_day()
-        _render_watchlist_alerts(state=watch_state)
+        _render_watchlist_alerts(state=watch_state, tab_key=None)
         if failed["code"] in flex.TOKEN_ERROR_CODES:
             sidebar_status.error(f"IBKR: {_SIDEBAR_TOKEN_STATUS[failed['code']]}")
             render_connect_card(code=failed["code"], query_id_missing=False)
@@ -2734,9 +2849,10 @@ def main() -> None:
 
     sidebar_status.success("IBKR: connected")
     render_sync_status(report=data["sync"])
+    _render_alert_bell(slot=bell_slot, state=watch_state)
     overview, positions, trades, price, watch, divs, perf, net_worth = st.tabs(
         ["Overview", "Positions", "Trades", "Prices", "Watchlist", "Dividends", "Performance",
-         "Net Worth"], key="tabs_main",
+         "Net Worth"], key=_TABS_MAIN, on_change="rerun",
     )
     with overview:
         tab_overview(data, watch_state=watch_state)

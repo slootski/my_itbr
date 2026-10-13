@@ -79,9 +79,22 @@ CREATE TABLE IF NOT EXISTS watchlist_refresh (
     until            TEXT,
     CHECK (until IS NULL OR interval_minutes IS NOT NULL)
 );
+
+CREATE TABLE IF NOT EXISTS watchlist_mutes (
+    symbol TEXT NOT NULL REFERENCES watchlist_items(symbol) ON DELETE CASCADE,
+    side   TEXT NOT NULL CHECK (side IN ('buy', 'sell')),
+    until  TEXT NOT NULL,
+    PRIMARY KEY (symbol, side)
+);
 """
 
+# The tables every read needs. watchlist_mutes is not one of them: a store made
+# before it existed still reads, with no alert hidden.
 _TABLES = ("watchlists", "watchlist_items", "watchlist_refresh")
+
+MUTE_TODAY = "today"
+MUTE_HOUR = "hour"
+_SNOOZE = dt.timedelta(hours=1)
 
 _LIST_COLS = ["id", "name", "count"]
 _ITEM_COLS = ["symbol", "list_id", "list_name", "buy_target", "sell_target", "added"]
@@ -370,6 +383,8 @@ def update_item(
             )
             if cursor.rowcount == 0:
                 raise WatchlistError(f"{symbol} is no longer on the watchlist.")
+            # An edited stock is a new decision: its alert is shown again.
+            conn.execute("DELETE FROM watchlist_mutes WHERE symbol = ?", (str(symbol),))
     except sqlite3.Error as exc:
         raise _write_error(exc=exc, unique=MSG_NOT_SAVED, foreign=MSG_LIST_GONE) from exc
 
@@ -431,6 +446,83 @@ def write_refresh(*, db_path: Path | str, interval_minutes: int | None, until: d
             )
     except sqlite3.Error as exc:
         raise _write_error(exc=exc, unique=MSG_NOT_SAVED, foreign=MSG_NOT_SAVED) from exc
+
+
+# ---- hidden alerts ---------------------------------------------------------
+
+def mute_until(*, kind: str, now: dt.datetime, tz: dt.tzinfo) -> dt.datetime:
+    """When a hidden alert comes back: in one hour, or at the next local midnight."""
+    moment = _aware(now=now)
+    if kind == MUTE_HOUR:
+        return moment + _SNOOZE
+    if kind == MUTE_TODAY:
+        tomorrow = moment.astimezone(tz).date() + dt.timedelta(days=1)
+        return dt.datetime.combine(tomorrow, dt.time.min, tzinfo=tz).astimezone(dt.timezone.utc)
+    raise ValueError(f"unknown mute kind: {kind!r}")
+
+
+def write_mute(*, db_path: Path | str, symbol: str, side: str, until: dt.datetime, now: dt.datetime) -> None:
+    """Hide one stock's buy or sell alert until ``until``; ended mutes are dropped."""
+    stored, moment = _aware(now=until).isoformat(), _aware(now=now).isoformat()
+    try:
+        with contextlib.closing(_write_conn(db_path=db_path)) as conn, conn:
+            conn.execute("DELETE FROM watchlist_mutes WHERE until <= ?", (moment,))
+            conn.execute(
+                "INSERT INTO watchlist_mutes (symbol, side, until) VALUES (?, ?, ?) "
+                "ON CONFLICT(symbol, side) DO UPDATE SET until = excluded.until",
+                (str(symbol), str(side), stored),
+            )
+    except sqlite3.Error as exc:
+        raise _write_error(exc=exc, unique=MSG_NOT_SAVED,
+                           foreign=f"{symbol} is no longer on the watchlist.") from exc
+
+
+def clear_mutes(*, db_path: Path | str) -> None:
+    """Show every hidden alert again."""
+    try:
+        with contextlib.closing(_write_conn(db_path=db_path)) as conn, conn:
+            conn.execute("DELETE FROM watchlist_mutes")
+    except sqlite3.Error as exc:
+        raise _write_error(exc=exc, unique=MSG_NOT_SAVED, foreign=MSG_NOT_SAVED) from exc
+
+
+def read_mutes(*, db_path: Path | str, now: dt.datetime) -> dict:
+    """``{(symbol, side): until}`` for the alerts hidden at ``now``.
+
+    No file, no table, a failed read or an unreadable time all hide nothing: a
+    shown alert is the safe side.
+    """
+    moment = _aware(now=now)
+    try:
+        conn = _read_conn(db_path=db_path)
+        if conn is None:
+            return {}
+        with contextlib.closing(conn):
+            rows = conn.execute("SELECT symbol, side, until FROM watchlist_mutes").fetchall()
+    except sqlite3.Error as exc:
+        logger.warning("watchlist mutes read failed: %s", exc)
+        return {}
+    mutes = {}
+    for symbol, side, stored in rows:
+        try:
+            until = dt.datetime.fromisoformat(stored)
+        except (TypeError, ValueError):
+            continue
+        if until.tzinfo is not None and until > moment:
+            mutes[(symbol, side)] = until
+    return mutes
+
+
+def visible_alerts(*, lines: list[dict], mutes: dict) -> dict:
+    """Split alert lines into ``shown`` and ``hidden`` (each hidden line gets ``until``)."""
+    shown, hidden = [], []
+    for line in lines:
+        key = (line["symbol"], line["side"])
+        if key in mutes:
+            hidden.append({**line, "until": mutes[key]})
+        else:
+            shown.append(line)
+    return {"shown": shown, "hidden": hidden}
 
 
 # ---- table, alerts, selection ----------------------------------------------
@@ -626,6 +718,11 @@ def _clock(*, moment: dt.datetime, now: dt.datetime, tz: dt.tzinfo) -> str:
 def fetched_label(*, fetched: dt.datetime, now: dt.datetime, tz: dt.tzinfo) -> str:
     """Local time of a fetch; with the date when it was not today."""
     return _clock(moment=fetched, now=now, tz=tz)
+
+
+def until_label(*, until: dt.datetime, now: dt.datetime, tz: dt.tzinfo) -> str:
+    """Local time an alert stays hidden to; with the date when that is not today."""
+    return _clock(moment=until, now=now, tz=tz)
 
 
 def refresh_label(*, setting: dict, now: dt.datetime, tz: dt.tzinfo) -> str:

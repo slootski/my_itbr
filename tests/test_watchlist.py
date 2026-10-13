@@ -492,6 +492,64 @@ def test_alerts_when_every_quote_failed_or_nothing_is_reached(three):
     assert watchlist.alerts(items=_items(three["db"]).iloc[0:0], quotes={})["all_failed"] is False
 
 
+# ---- hidden alerts ---------------------------------------------------------
+
+def test_mute_until_is_one_hour_or_the_next_local_midnight():
+    now = dt.datetime(2026, 10, 12, 21, 30, tzinfo=UTC)       # 00:30 on the 13th in Jerusalem
+    zone = ZoneInfo("Asia/Jerusalem")
+    assert watchlist.mute_until(kind=watchlist.MUTE_HOUR, now=now, tz=zone) == now + dt.timedelta(hours=1)
+    assert watchlist.mute_until(kind=watchlist.MUTE_TODAY, now=now, tz=zone) == dt.datetime(
+        2026, 10, 14, 0, 0, tzinfo=zone)
+    assert watchlist.mute_until(kind=watchlist.MUTE_TODAY, now=now, tz=UTC) == dt.datetime(
+        2026, 10, 13, 0, 0, tzinfo=UTC)
+    with pytest.raises(ValueError):
+        watchlist.mute_until(kind="week", now=now, tz=UTC)
+    with pytest.raises(ValueError):
+        watchlist.mute_until(kind=watchlist.MUTE_HOUR, now=now.replace(tzinfo=None), tz=UTC)
+
+
+def test_mutes_are_stored_end_and_follow_their_stock(db):
+    list_id = _list(db, "Quantum")
+    _add(db, list_id, "IONQ", 42.0, 60.0)
+    _add(db, list_id, "QTUM", 150.0, None)
+    hour = NOW + dt.timedelta(hours=1)
+    watchlist.write_mute(db_path=db, symbol="IONQ", side="buy", until=hour, now=NOW)
+    watchlist.write_mute(db_path=db, symbol="QTUM", side="buy", until=NOW + dt.timedelta(hours=9), now=NOW)
+    assert watchlist.read_mutes(db_path=db, now=NOW)[("IONQ", "buy")] == hour
+    assert set(watchlist.read_mutes(db_path=db, now=hour)) == {("QTUM", "buy")}        # ended at its time
+    watchlist.write_mute(db_path=db, symbol="IONQ", side="buy", until=hour + dt.timedelta(hours=1), now=NOW)
+    assert watchlist.read_mutes(db_path=db, now=hour)[("IONQ", "buy")] == hour + dt.timedelta(hours=1)
+    watchlist.update_item(db_path=db, symbol="IONQ", list_id=list_id, buy_target=41.0, sell_target=60.0)
+    assert set(watchlist.read_mutes(db_path=db, now=NOW)) == {("QTUM", "buy")}         # an edit shows it again
+    watchlist.remove_item(db_path=db, symbol="QTUM")
+    assert watchlist.read_mutes(db_path=db, now=NOW) == {}
+    with pytest.raises(watchlist.WatchlistError, match="QTUM is no longer on the watchlist."):
+        watchlist.write_mute(db_path=db, symbol="QTUM", side="buy", until=hour, now=NOW)
+    with pytest.raises(watchlist.WatchlistError):
+        watchlist.write_mute(db_path=db, symbol="IONQ", side="hold", until=hour, now=NOW)
+    watchlist.write_mute(db_path=db, symbol="IONQ", side="sell", until=hour, now=NOW)
+    watchlist.clear_mutes(db_path=db)
+    assert watchlist.read_mutes(db_path=db, now=NOW) == {}
+
+
+def test_mutes_of_a_store_without_the_table_or_the_file_hide_nothing(db, tmp_path):
+    with sqlite3.connect(db) as conn:
+        conn.execute("DROP TABLE watchlist_mutes")             # a store made before the table existed
+    assert watchlist.read_mutes(db_path=db, now=NOW) == {}
+    assert not watchlist.read_lists(db_path=db)["error"]       # the other reads still work
+    assert watchlist.read_mutes(db_path=tmp_path / "none.sqlite", now=NOW) == {}
+    watchlist.init_db(db_path=db)                              # the next start adds it
+    assert watchlist.read_mutes(db_path=db, now=NOW) == {}
+
+
+def test_visible_alerts_splits_shown_and_hidden():
+    lines = [{"symbol": "IONQ", "side": "buy"}, {"symbol": "IONQ", "side": "sell"}, {"symbol": "QTUM", "side": "buy"}]
+    until = NOW + dt.timedelta(hours=1)
+    split = watchlist.visible_alerts(lines=lines, mutes={("IONQ", "buy"): until})
+    assert split["shown"] == lines[1:]
+    assert split["hidden"] == [{"symbol": "IONQ", "side": "buy", "until": until}]
+
+
 # ---- selection -------------------------------------------------------------
 
 ORDER = ["IONQ", "QTUM", "RGTI"]

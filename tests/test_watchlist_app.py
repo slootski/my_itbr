@@ -638,7 +638,9 @@ def test_overview_alert_box(watch):
         ":material/notifications_active: :red-badge[SELL] **COPX** 61.30 USD is at or above your Sell above price 60.00 · Metals"]
     assert "No price for: RGTI. Its target was not checked." in _texts(at)   # NOTGT has no target
     assert any(text.startswith("Fetched 10:07.") for text in box)
-    assert not [b for b in next(t for t in at.tabs if t.label == "Overview").button]   # D16
+    keys = [b.key for b in next(t for t in at.tabs if t.label == "Overview").button]
+    assert keys == [f"wl_alert_{action}_{stock}" for stock in ("IONQ_buy", "COPX_sell")
+                    for action in ("open", "snooze", "today")]
     # D14: a new session opens on the first alert's list and stock.
     assert at.session_state["wl_list"] == ids["Quantum"] and at.session_state["wl_symbol"] == "IONQ"
     assert at.selectbox(key="wl_list_select").options[:2] == ["Metals (1 alert)", "Quantum (1 alert)"]
@@ -648,6 +650,96 @@ def test_overview_alert_box(watch):
     assert at.session_state["wl_symbol"] == "IONQ"            # the user is not moved
     assert "Quantum (2 alerts)" in at.selectbox(key="wl_list_select").options
     assert not at.error
+
+
+def _alert_text(watch) -> list[str]:
+    return [text for text in _box(watch) if "badge" in text]
+
+
+def test_alert_link_opens_the_watchlist_on_that_stock(watch):
+    ids = watch.seed(lists={"Metals": [("COPX", None, 60.0)], "Quantum": [("IONQ", None, None), ("QTUM", 150.0, None)]})
+    watch.quotes = {"COPX": _q(61.30, 61.0), "IONQ": _q(41.10, 42.0), "QTUM": _q(140.0, 150.0)}
+    at = watch.run()
+    assert at.session_state["tabs_main"] == "Overview"
+    at = watch.click("wl_alert_open_QTUM_buy")
+    assert at.session_state["tabs_main"] == "Watchlist"
+    assert at.session_state["wl_list"] == ids["Quantum"] and at.session_state["wl_symbol"] == "QTUM"
+    assert at.button(key="wl_edit_stock").label == "Edit / move / remove: QTUM"
+
+
+def test_bell_shows_off_overview_and_leads_back_to_it(watch):
+    watch.seed(lists={"Quantum": [("IONQ", 42.0, None), ("QTUM", 150.0, None)]})
+    watch.quotes = {"IONQ": _q(41.10, 42.0), "QTUM": _q(140.0, 150.0)}
+    watch.run()
+    assert not watch.has("wl_bell")                           # on Overview the box itself is in view
+    watch.at.session_state["tabs_main"] = "Trades"
+    at = watch.run()
+    bell = at.button(key="wl_bell")
+    assert bell.label == "2" and bell.proto.type == "tertiary"
+    at = watch.click("wl_bell")
+    assert at.session_state["tabs_main"] == "Overview" and not watch.has("wl_bell")
+    # AppTest has no browser to send the open tab back, so it is set before each run.
+    watch.click("wl_alert_today_IONQ_buy")                    # one alert hidden: the bell counts the rest
+    watch.at.session_state["tabs_main"] = "Trades"
+    assert watch.run().button(key="wl_bell").label == "1"
+    watch.click("wl_alert_snooze_QTUM_buy")
+    watch.at.session_state["tabs_main"] = "Trades"
+    watch.run()
+    assert not watch.has("wl_bell")                           # every alert hidden: no bell
+
+
+def test_snoozed_alert_stays_hidden_after_a_restart_and_returns_in_an_hour(watch):
+    watch.seed(lists={"Quantum": [("IONQ", 42.0, None), ("QTUM", 150.0, None)]})
+    watch.quotes = {"IONQ": _q(41.10, 42.0), "QTUM": _q(140.0, 150.0)}
+    watch.run()
+    at = watch.click("wl_alert_snooze_IONQ_buy")
+    assert [t.value for t in at.toast] == ["IONQ alert hidden until 11:07."]
+    assert [text.split("**")[1] for text in _alert_text(watch)] == ["QTUM"]
+    assert "Hidden: IONQ until 11:07." in _box(watch)
+    assert watch.at.session_state["wl_symbol"] == "IONQ"      # the Watchlist tab is not changed by it
+    assert list(watch.table()["Alert"]) == ["At or below buy price"] * 2
+
+    restarted = AppTest.from_file(str(APP_PATH), default_timeout=30)   # the server was restarted
+    restarted.run()
+    assert not restarted.exception
+    assert not any("**IONQ**" in m.value for m in restarted.markdown)
+    watch.now = NOW + dt.timedelta(minutes=59)
+    restarted.run()
+    assert not any("**IONQ**" in m.value for m in restarted.markdown)
+    watch.now = NOW + dt.timedelta(minutes=60)                # the hour is over
+    restarted.run()
+    assert any("**IONQ**" in m.value for m in restarted.markdown)
+    assert not any("Hidden:" in str(c.value) for c in restarted.caption)
+
+
+def test_alert_hidden_for_today_returns_at_local_midnight(watch):
+    watch.seed(lists={"Quantum": [("IONQ", 42.0, None)]})
+    watch.quotes = {"IONQ": _q(41.10, 42.0)}
+    watch.run()
+    at = watch.click("wl_alert_today_IONQ_buy")
+    assert [t.value for t in at.toast] == ["IONQ alert hidden until tomorrow."]
+    assert _alert_text(watch) == [] and any(text.startswith("Hidden: IONQ until 13 Oct") for text in _box(watch))
+    watch.now = dt.datetime(2026, 10, 12, 23, 59, tzinfo=UTC)
+    watch.run()
+    assert _alert_text(watch) == []
+    watch.now = dt.datetime(2026, 10, 13, 0, 0, tzinfo=UTC)
+    watch.run()
+    assert len(_alert_text(watch)) == 1
+
+
+def test_hidden_alerts_can_be_shown_again_and_an_edit_shows_its_alert(watch):
+    ids = watch.seed(lists={"Quantum": [("IONQ", 42.0, None), ("QTUM", 150.0, None)]})
+    watch.quotes = {"IONQ": _q(41.10, 42.0), "QTUM": _q(140.0, 150.0)}
+    watch.run()
+    watch.click("wl_alert_today_IONQ_buy")
+    watch.click("wl_alert_today_QTUM_buy")
+    assert _alert_text(watch) == [] and watch.has("wl_alert_show_hidden")
+    watchlist.update_item(db_path=watch.db, symbol="QTUM", list_id=ids["Quantum"],
+                          buy_target=145.0, sell_target=None)   # a changed target is a new decision
+    watch.run()
+    assert [text.split("**")[1] for text in _alert_text(watch)] == ["QTUM"]
+    watch.click("wl_alert_show_hidden")
+    assert len(_alert_text(watch)) == 2 and not watch.has("wl_alert_show_hidden")
 
 
 def test_overview_box_when_prices_are_missing(watch):

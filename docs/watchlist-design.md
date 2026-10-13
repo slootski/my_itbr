@@ -26,7 +26,7 @@ Answered by the user on 2026-10-12 unless marked "designer".
 | D13 | Schedule control | At the top of the Watchlist tab, with an **Update now** button that fetches watchlist prices only. |
 | D14 | Opening list | A new session opens on the list that holds the first alert, with that stock selected. With no alert: the first list by name. The list dropdown shows each list's alert count. |
 | D15 | Distance | A positive distance left to the target, and "reached" when the target is hit. |
-| D16 | Alert box | Text only, no button that switches tab. |
+| D16 | Alert box | Each alert line has **Open in Watchlist**, **Snooze 1 hour** and **Hide for today** (changed 2026-10-13 by D36; before: text only, no button that switches tab). |
 | D17 | Backups | Every watchlist change refreshes today's backup file. |
 | D18 | IBKR not connected | Watchlist and the alert box still work. "Shares held" and the position tiles are empty. |
 | D19 | Ticker spelling | `BRK.B`, `BRK B` and `BRK-B` are one stock: stored in the yfinance spelling, matched to the IBKR position. |
@@ -46,6 +46,8 @@ Answered by the user on 2026-10-12 unless marked "designer".
 | D33 | Default selection (user, 2026-10-13) | A list opens with no stock selected: no chart, no tiles, **Edit / move / remove** disabled. A row click, ▲ ▼, the ticker search, adding a stock or the first alert of a new session (D14) selects one. The selected row's circle is expected to clear it (not checked in the browser). The button is primary while a stock is selected. |
 | D34 | List and update buttons (user, 2026-10-13) | **New list**, **Rename** and **Delete** are in one **List actions** menu; opening a dialog closes it. **Update now** and **Update schedule** are borderless text buttons at the right of the status line. |
 | D35 | Wording (user, 2026-10-13) | The screen says **Buy below** and **Sell above**, not "Buy target" and "Sell target". The distance columns are **To buy** and **To sell**. The alert texts are `At or below buy price` and `At or above sell price`. Code and database names keep `buy_target` / `sell_target`. |
+| D36 | Alert actions (user, 2026-10-13) | **Open in Watchlist** opens the Watchlist tab on the alert's list and stock. **Snooze 1 hour** hides the alert for 60 minutes; **Hide for today** hides it until the next local midnight. Hidden alerts are stored in the database, so a restart keeps them hidden. A line `Hidden: SYMBOL until TIME` with **Show hidden alerts** brings them back. Editing a stock shows its alert again. Hiding changes the Overview box and the bell only: the Watchlist table's Alert column, the `(N alerts)` counts and the opening list (D14) do not change. |
+| D37 | Bell (user, 2026-10-13) | While an alert is shown and the open tab is not Overview, a ringing bell with the alert count is at the top right, on the title's row. A click opens Overview. Not in the layouts without an Overview tab (IBKR not connected or failed): there the box is above the tabs. The main tabs now track their state, so every tab click reruns the app. |
 
 Facts that limit the design (checked in this repo and by the reviewers' experiments in
 rounds 1 and 2):
@@ -1455,3 +1457,32 @@ a thick amber left bar, larger text, a bell icon on each line, and no "Watchlist
 (N)" title (the user asked to remove it). The line reads `BUY AMKBY 18.48 USD is at or
 below your Buy below price 19.00 · Buy list`. The box for a missing price only stays plain
 with its "Watchlist prices" title. Not checked in the browser.
+
+### Change — 2026-10-13 — alert actions and the bell (D36, D37, on the user's request)
+
+- New table, created by `init_db` with `CREATE TABLE IF NOT EXISTS` (safe on an existing DB):
+
+  ```
+  CREATE TABLE IF NOT EXISTS watchlist_mutes (
+      symbol TEXT NOT NULL REFERENCES watchlist_items(symbol) ON DELETE CASCADE,
+      side   TEXT NOT NULL CHECK (side IN ('buy', 'sell')),
+      until  TEXT NOT NULL,
+      PRIMARY KEY (symbol, side)
+  );
+  ```
+
+  It is not in `_TABLES`: a store without it still reads, and hides nothing. A failed or
+  unreadable mute read hides nothing. Ended rows are deleted by the next `write_mute`.
+- New in `data/watchlist.py`: `mute_until`, `write_mute`, `clear_mutes`, `read_mutes`,
+  `visible_alerts`, `until_label`. `update_item` deletes the stock's mutes.
+- `app.py`: `st.tabs(..., key="tabs_main", on_change="rerun")`; a button callback writes the
+  tab's label to `st.session_state["tabs_main"]`.
+- A snoozed alert returns on the first rerun after its hour. With "only when I open the
+  app" nothing reruns by itself, so it returns on the next click or reload.
+- Tests: `mute_until` for both kinds and a zone; store, end, edit, remove, clear; a store
+  without the table; the link sets tab, list and stock; the bell off Overview and its
+  click; a second `AppTest` on the same DB keeps a snoozed alert hidden, and it returns
+  after 60 minutes; "today" returns at local midnight.
+- Not checked in the browser: the tab really switches on a click; the bell's place on the
+  title's row and that it rings (the CSS targets `[data-testid="stIconMaterial"]`); the
+  three buttons fit on the alert's line.

@@ -80,7 +80,9 @@ snapshot for the Net Worth tab.
   day change and how far the price is from each target; picking a row (its circle, or ▲ ▼)
   shows the Prices-style tiles and chart with the target lines. Stocks can be added,
   moved between lists and removed. While a price is at or below its Buy below price, or at
-  or above its Sell above price, an amber alert box shows at the top of Overview. Prices
+  or above its Sell above price, an amber alert box shows at the top of Overview. Each alert can be opened in the
+  Watchlist, snoozed for an hour or hidden until tomorrow; while one is shown, a bell at the
+  top right leads back to Overview. Prices
   are fetched when the app opens; **Update schedule** can re-fetch every N minutes, for a
   number of hours or with no end time (only while the page is open), and **Update now**
   fetches at once. Lists and targets live in the SQLite store, and every change refreshes
