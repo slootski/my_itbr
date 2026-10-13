@@ -282,6 +282,10 @@ def test_day_labels_give_each_days_own_return(year):
         [y / 40 * perf_calendar.SPARK_HEIGHT_PX for y in ys[1:]], abs=0.01)
 
 
+def test_fmt_weekday_date():
+    assert perf_calendar.fmt_weekday_date(date=D(2025, 11, 13)) == "Thu 13-11-2025"
+
+
 @pytest.mark.parametrize("ret, text", [
     (0.0123, "+1.2"), (-0.0042, "−0.4"), (0.0, "0.0"), (0.0004, "0.0"), (-0.0004, "0.0"), (0.105, "+10.5"),
 ])
@@ -292,10 +296,18 @@ def test_fmt_day_label(ret, text):
 def test_month_row_writes_the_day_labels_over_the_line(year):
     march = perf_calendar.month_row_html(month=year[2], dark=False)
     assert march.count('<span class="lbl ') == 5
-    assert '<span class="lbl below" style="left:' in march and ">−1.8</span>" in march
+    assert '<span class="lbl below" data-date="Fri 06-03-2026" style="left:' in march
+    assert ">−1.8</span>" in march
+    # Each label carries its own day for the hover text.
+    assert [part.split('"')[0] for part in march.split('data-date="')[1:]] == [
+        "Mon 02-03-2026", "Tue 03-03-2026", "Wed 04-03-2026", "Fri 06-03-2026", "Mon 09-03-2026"]
     june = perf_calendar.month_row_html(month=year[5], dark=False)
     assert '<div class="lbls"></div>' in june                   # no days, no labels
     css = perf_calendar.styles_html()
+    # The date shows on hover; the chart is over the row's button but only a label takes the pointer.
+    assert ".perfyear .lbl:hover::after { content: attr(data-date);" in css
+    assert "position: relative; z-index: 6; pointer-events: none; }" in css
+    assert "pointer-events: auto; cursor: default; }" in css
     # Too narrow to keep the labels apart: they are not shown.
     assert (f"@container (max-width: {perf_calendar.LABELS_MIN_WIDTH_PX}px) "
             "{ .perfyear .lbl { display: none; } }") in css

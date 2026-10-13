@@ -212,13 +212,23 @@ _PERF_CSS = f"""
 .perfyear .name {{ font-size: 13px; font-weight: 600; color: var(--ink-2); }}
 /* The month's line: an image, stretched to the column's width, with a band
    above and below it for the day labels. */
-.perfyear .chart {{ container-type: inline-size; padding: {LABEL_BAND_PX}px 0; }}
+/* The chart lies over the row's open-month button so a day label can be hovered; it lets
+   every other pointer event through, so a click anywhere but on a label still opens the month. */
+.perfyear .chart {{ container-type: inline-size; padding: {LABEL_BAND_PX}px 0;
+  position: relative; z-index: 6; pointer-events: none; }}
 .perfyear .spark {{ display: block; width: 100%; height: {SPARK_HEIGHT_PX}px; }}
 .perfyear .lbls {{ position: relative; height: 0; top: -{SPARK_HEIGHT_PX}px; }}
+/* The padding is the hover area; the offsets take it back, so the text stays where it was. */
 .perfyear .lbl {{ position: absolute; font-size: 10px; line-height: 1; white-space: nowrap;
-  color: var(--ink-2); }}
-.perfyear .lbl.above {{ transform: translate(-50%, calc(-100% - 4px)); }}
-.perfyear .lbl.below {{ transform: translate(-50%, 5px); }}
+  color: var(--ink-2); padding: 3px 4px; pointer-events: auto; cursor: default; }}
+.perfyear .lbl.above {{ transform: translate(-50%, calc(-100% - 1px)); }}
+.perfyear .lbl.below {{ transform: translate(-50%, 2px); }}
+.perfyear .lbl:hover {{ color: var(--ink); font-weight: 650; z-index: 40; }}
+/* The hovered day's date, over the label. */
+.perfyear .lbl:hover::after {{ content: attr(data-date); position: absolute; left: 50%;
+  bottom: calc(100% + 2px); transform: translateX(-50%); padding: 4px 8px; border-radius: 6px;
+  background: var(--surface-2); color: var(--ink); border: 1px solid var(--line-strong);
+  box-shadow: 0 4px 12px rgba(0,0,0,.22); font-size: 11.5px; font-weight: 500; }}
 @container (max-width: {LABELS_MIN_WIDTH_PX}px) {{ .perfyear .lbl {{ display: none; }} }}
 .perfyear .totals {{ display: contents; }}
 .perfyear .pct {{ font-size: 14px; font-weight: 650; text-align: right; }}
@@ -256,6 +266,11 @@ def fmt_money(*, value: float | None) -> str:
 
 def fmt_date(*, date: dt.date) -> str:
     return f"{date:%d-%m-%Y}"
+
+
+def fmt_weekday_date(*, date: dt.date) -> str:
+    """A date with its weekday, for the hover text of a day on a month's line."""
+    return f"{_calendar.day_abbr[date.weekday()]} {fmt_date(date=date)}"
 
 
 def fmt_mover(*, mover: dict, currency: str | None) -> str:
@@ -537,12 +552,13 @@ def day_labels(*, month: dict) -> list[dict]:
 
 def _spark(*, month: dict, dark: bool) -> str:
     """The month's line as an image, with each day's return written at its
-    point. No tooltip: the row is a single click target, so one could never show."""
+    point. Hovering a return shows that day's date."""
     svg, kind, label = spark_svg(month=month, dark=dark)
     name = f"{_calendar.month_name[month['month']]} {month['year']}"
     data = base64.b64encode(svg.encode()).decode()
     labels = "".join(
-        f'<span class="lbl {item["side"]}" style="left:{item["left"]:.2f}%;top:{item["top"]:.1f}px">'
+        f'<span class="lbl {item["side"]}" data-date="{fmt_weekday_date(date=item["date"])}" '
+        f'style="left:{item["left"]:.2f}%;top:{item["top"]:.1f}px">'
         f'{html.escape(item["text"])}</span>'
         for item in day_labels(month=month)
     )
