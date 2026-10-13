@@ -951,7 +951,8 @@ def _render_watchlist_alerts(*, state: dict, tab_key: str | None) -> None:
 
 
 # The bell rings while an alert is shown and the Watchlist tab is not the open one.
-# It is pinned to the app's top bar, left of Streamlit's own "Deploy", above the bar's layer.
+# It is pinned to the app's top bar, left of Streamlit's own status widget and "Deploy",
+# above the bar's layer.
 _WL_BELL_CSS = """
 <style>
 @keyframes wl-ring {
@@ -961,12 +962,19 @@ _WL_BELL_CSS = """
   40% { transform: rotate(6deg); } 48% { transform: rotate(-3deg); }
 }
 .st-key-wl_bell {
-  position: fixed; top: 0.45rem; right: 8.5rem; z-index: 1000001; width: auto !important;
+  /* Left of the "Running... Stop" widget, which shows left of Deploy while the app runs. */
+  position: fixed; top: 0.35rem; right: 14rem; z-index: 1000001; width: auto !important;
 }
-.st-key-wl_bell button, .st-key-wl_bell button:hover { color: #e02424; }
-.st-key-wl_bell button p { font-size: 1.25rem; font-weight: 800; }
+/* !important: the theme's hover, focus and active colours are more specific. */
+.st-key-wl_bell button, .st-key-wl_bell button * { color: #e02424 !important; }
+.st-key-wl_bell button { gap: 0.15rem; white-space: nowrap; }
+.st-key-wl_bell button:focus-visible { outline-color: #e02424; box-shadow: none; }
+.st-key-wl_bell button p { font-size: 1.25rem; font-weight: 800; line-height: 1; }
+/* The icon has a fixed box; a bigger glyph must grow it or it covers the count. */
 .st-key-wl_bell button [data-testid="stIconMaterial"] {
-  font-size: 2.4rem; transform-origin: 50% 10%; animation: wl-ring 1.6s ease-in-out infinite;
+  font-size: 2.2rem !important; width: 2.2rem !important; height: 2.2rem !important;
+  line-height: 1 !important; margin: 0 !important;
+  transform-origin: 50% 10%; animation: wl-ring 1.6s ease-in-out infinite;
 }
 @media (prefers-reduced-motion: reduce) {
   .st-key-wl_bell button [data-testid="stIconMaterial"] { animation: none; }

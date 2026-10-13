@@ -1491,3 +1491,7 @@ with its "Watchlist prices" title. Not checked in the browser.
   but Watchlist, and a click opens the Watchlist on the first shown alert's list and stock.
   Not checked in the browser: its place and height next to "Deploy", and that it is above
   the bar and can be clicked.
+- Bell fix after the user's screenshot: it sat on Streamlit's "Running... Stop" widget,
+  was blue (the theme's focus colour won) and its count lay over the icon. Now it is
+  further left (`right: 14rem`), red with `!important`, and the icon's box grows with the
+  glyph. Not checked in the browser.
