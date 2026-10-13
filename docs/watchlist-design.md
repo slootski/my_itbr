@@ -44,6 +44,7 @@ Answered by the user on 2026-10-12 unless marked "designer".
 | D32 | Picking a stock (answered during implementation, after the browser spike) | Streamlit selects a table row only by the small circle at the row's left edge, not by a click elsewhere in the row. The circle stays, and ▲ ▼ buttons next to "Edit / move / remove" step through the list, as on Prices. The caption says so. |
 | D31 | Pre-sync file without its day file (designer) | Deleted when its day is no longer among the kept days. Kept days = the newest `keep` distinct days over main and pre-sync files together. |
 | D33 | Default selection (user, 2026-10-13) | A list opens with no stock selected: no chart, no tiles, **Edit / move / remove** disabled. A row click, ▲ ▼, the ticker search, adding a stock or the first alert of a new session (D14) selects one. The selected row's circle is expected to clear it (not checked in the browser). The button is primary while a stock is selected. |
+| D34 | List and update buttons (user, 2026-10-13) | **New list**, **Rename** and **Delete** are in one **List actions** menu; opening a dialog closes it. **Update now** and **Update schedule** are borderless text buttons at the right of the status line. |
 
 Facts that limit the design (checked in this repo and by the reviewers' experiments in
 rounds 1 and 2):
@@ -107,12 +108,12 @@ rounds 1 and 2):
 
 Clicks counted from the Watchlist tab; typing not counted.
 
-**F1. Create a list** (2 clicks): **＋ New list** → type the name → **Create**. The new
+**F1. Create a list** (3 clicks): **List actions** → **New list** → type the name → **Create**. The new
 list is selected and shown empty.
 
-**F2. Rename a list** (2 clicks): **Rename** → change the name → **Save**.
+**F2. Rename a list** (3 clicks): **List actions** → **Rename <list>** → change the name → **Save**.
 
-**F3. Delete a list** (2 clicks): **Delete** → the dialog says `Delete list "Quantum"? It
+**F3. Delete a list** (3 clicks): **List actions** → **Delete <list>** → the dialog says `Delete list "Quantum"? It
 holds 3 stocks: QTUM, IONQ, RGTI. Their buy and sell targets are deleted too. This cannot
 be undone.` → **Delete list**. The first remaining list becomes selected. An empty list
 shows `Delete list "Quantum"? It is empty.` More than 10 stocks: the first 10 and
@@ -160,8 +161,8 @@ Watchlist
 ### 3.2 Empty list (stocks exist in another list)
 
 ```
-List [ Quantum                 ▾]  [＋ New list] [Rename] [Delete]
-Prices fetched 10:02 · updates: only when I open the app      [Update now] [Update schedule]
+List [ Quantum                 ▾]                              [ List actions ▾ ]
+Prices fetched 10:02 · updates: only when I open the app      ↻ Update now  ◷ Update schedule
 Alerts in other lists: Metals (1)
 
 ┌──────────────────────────────────────────────────────────────────────┐
@@ -176,9 +177,9 @@ any list. The "Alerts in other lists" line is shown only when another list has a
 ### 3.3 Filled list, a row selected
 
 ```
-List [ Quantum (1 alert)       ▾]  [＋ New list] [Rename] [Delete]
+List [ Quantum (1 alert)       ▾]                              [ List actions ▾ ]
 Prices fetched 10:07 · updates: every 1 min until 14:02 · works only while this page is open
-                                                            [Update now] [Update schedule]
+                                                            ↻ Update now  ◷ Update schedule
 Alerts in other lists: Metals (1)
 
 [＋ Add stock]  [Edit / move / remove: QTUM]
@@ -1432,4 +1433,9 @@ Prices fetched 10:02 · updates: only when I open the app   ↻ Update now  ◷ 
 - **Update now** and **Update schedule** are borderless text buttons at the right of the
   status line.
 - The state with no lists (3.1) keeps its single **＋ New list** button.
-- Not checked in the browser.
+- The open menu does not stop the timed redraw (D9): `wl_list_menu` is not in
+  `DIALOG_FLAGS`, which tests a key's presence and this key is always present. A tracked
+  popover is expected to stay open across a redraw.
+- Not checked in the browser: the menu's place and alignment, the two text buttons on one
+  line with the status text (columns 3:2), the menu closing when a dialog opens, the menu
+  across a timed redraw.
