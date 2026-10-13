@@ -1475,8 +1475,9 @@ with its "Watchlist prices" title. Not checked in the browser.
   unreadable mute read hides nothing. Ended rows are deleted by the next `write_mute`.
 - New in `data/watchlist.py`: `mute_until`, `write_mute`, `clear_mutes`, `read_mutes`,
   `visible_alerts`, `until_label`. `update_item` deletes the stock's mutes.
-- `app.py`: `st.tabs(..., key="tabs_main", on_change="rerun")`; a button callback writes the
-  tab's label to `st.session_state["tabs_main"]`.
+- `app.py`: `st.tabs(..., default=<label>, key=f"tabs_main_{nonce}", on_change="rerun")`; a
+  button callback stores a new nonce and the tab's label in `st.session_state["tab_jump"]`
+  (see the bug fix at the end of this file for why the tab is not written to the tabs' key).
 - A snoozed alert returns on the first rerun after its hour. With "only when I open the
   app" nothing reruns by itself, so it returns on the next click or reload.
 - Tests: `mute_until` for both kinds and a zone; store, end, edit, remove, clear; a store
@@ -1495,3 +1496,13 @@ with its "Watchlist prices" title. Not checked in the browser.
   was blue (the theme's focus colour won) and its count lay over the icon. Now it is
   further left (`right: 14rem`), red with `!important`, and the icon's box grows with the
   glyph. Not checked in the browser.
+
+### Bug fix — 2026-10-13 — a list change in the Watchlist opened Overview
+
+Found by the user: after the bell or **Open in Watchlist**, picking another list opened
+the Overview tab. Cause, read in Streamlit 1.58's tab component: when the app writes a tab
+to the tabs' key, the browser shows that tab but its stored value for the tabs stays the
+last tab the user clicked; the next click on any widget sends that old value back.
+Fix: a jump gives the tabs a new key and the wanted tab as `default`, so no old value
+exists for them. `_current_tab()` reads the user's last click on the current key, else the
+jump's tab. The test covers the state on the Python side; the browser side is not checked.

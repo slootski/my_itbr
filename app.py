@@ -728,8 +728,32 @@ _WL_SYMBOL = "wl_symbol"
 # Column widths of the stock buttons' row: Add stock, Edit / move / remove, the rest.
 _WL_STOCK_ROW = [1.2, 2.4, 5]
 _WL_DIALOG = "wl_dialog"
-# The main tabs track their state, so a button can open a tab (the alert box's link, the bell).
+# The main tabs track their state, so the app knows the open tab. A button opens a tab
+# (the alert box's link, the bell) by giving the tabs a new key and that tab as the default.
+# Writing the tab to the tabs' own key does not hold: the browser keeps the last tab the
+# user clicked and sends it back on the next click anywhere, which opened Overview again.
 _TABS_MAIN = "tabs_main"
+_TAB_JUMP = "tab_jump"
+_FIRST_TAB = "Overview"
+
+
+def _tab_jump() -> dict:
+    """The last tab a button opened: ``{"nonce": int, "label": str}``."""
+    return st.session_state[_TAB_JUMP] if _TAB_JUMP in st.session_state else {"nonce": 0, "label": _FIRST_TAB}
+
+
+def _tabs_key() -> str:
+    return f"{_TABS_MAIN}_{_tab_jump()['nonce']}"
+
+
+def _current_tab() -> str:
+    """The open main tab: the user's last click, else the tab a button opened."""
+    key = _tabs_key()
+    return st.session_state[key] if key in st.session_state else _tab_jump()["label"]
+
+
+def _jump_to_tab(*, label: str) -> None:
+    st.session_state[_TAB_JUMP] = {"nonce": _tab_jump()["nonce"] + 1, "label": label}
 _WL_LIST_MENU = "wl_list_menu"
 _QUOTE_WORKERS = 6
 
@@ -843,7 +867,7 @@ def _open_alert_stock(*, symbol: str, list_id: int, tab_key: str | None) -> None
     st.session_state[_WL_LIST] = list_id
     st.session_state[_WL_SYMBOL] = symbol
     if tab_key is not None:
-        st.session_state[tab_key] = "Watchlist"
+        _jump_to_tab(label="Watchlist")
 
 
 def _mute_alert(*, symbol: str, side: str, kind: str) -> None:
@@ -986,8 +1010,7 @@ _WL_BELL_CSS = """
 def _render_alert_bell(*, state: dict) -> None:
     """A ringing bell in the top bar that opens the Watchlist on the first shown alert."""
     shown = _alert_lines(state=state)["shown"]
-    on_watchlist = _TABS_MAIN in st.session_state and st.session_state[_TABS_MAIN] == "Watchlist"
-    if not shown or on_watchlist:
+    if not shown or _current_tab() == "Watchlist":
         return
     count, first = len(shown), shown[0]
     st.html(_WL_BELL_CSS)
@@ -2861,7 +2884,7 @@ def main() -> None:
     _render_alert_bell(state=watch_state)
     overview, positions, trades, price, watch, divs, perf, net_worth = st.tabs(
         ["Overview", "Positions", "Trades", "Prices", "Watchlist", "Dividends", "Performance",
-         "Net Worth"], key=_TABS_MAIN, on_change="rerun",
+         "Net Worth"], default=_tab_jump()["label"], key=_tabs_key(), on_change="rerun",
     )
     with overview:
         tab_overview(data, watch_state=watch_state)

@@ -652,6 +652,17 @@ def test_overview_alert_box(watch):
     assert not at.error
 
 
+def _open_tab(at) -> str:
+    return at.session_state["tab_jump"]["label"] if "tab_jump" in at.session_state else "Overview"
+
+
+def _on_tab(watch, label: str) -> None:
+    """Put the app on a tab the way a jump does (AppTest cannot click a tab)."""
+    nonce = watch.at.session_state["tab_jump"]["nonce"] + 1 if "tab_jump" in watch.at.session_state else 1
+    watch.at.session_state["tab_jump"] = {"nonce": nonce, "label": label}
+    watch.run()
+
+
 def _alert_text(watch) -> list[str]:
     return [text for text in _box(watch) if "badge" in text]
 
@@ -660,9 +671,9 @@ def test_alert_link_opens_the_watchlist_on_that_stock(watch):
     ids = watch.seed(lists={"Metals": [("COPX", None, 60.0)], "Quantum": [("IONQ", None, None), ("QTUM", 150.0, None)]})
     watch.quotes = {"COPX": _q(61.30, 61.0), "IONQ": _q(41.10, 42.0), "QTUM": _q(140.0, 150.0)}
     at = watch.run()
-    assert at.session_state["tabs_main"] == "Overview"
+    assert _open_tab(at) == "Overview"
     at = watch.click("wl_alert_open_QTUM_buy")
-    assert at.session_state["tabs_main"] == "Watchlist"
+    assert _open_tab(at) == "Watchlist"
     assert at.session_state["wl_list"] == ids["Quantum"] and at.session_state["wl_symbol"] == "QTUM"
     assert at.button(key="wl_edit_stock").label == "Edit / move / remove: QTUM"
 
@@ -675,19 +686,20 @@ def test_bell_shows_off_the_watchlist_tab_and_opens_it_on_the_first_alert(watch)
     assert bell.label == "2" and bell.proto.type == "tertiary"
     at.session_state["wl_list"], at.session_state["wl_symbol"] = ids["Metals"], "COPX"
     at = watch.click("wl_bell")
-    assert at.session_state["tabs_main"] == "Watchlist" and not watch.has("wl_bell")
+    assert _open_tab(at) == "Watchlist" and not watch.has("wl_bell")
     assert at.session_state["wl_list"] == ids["Quantum"] and at.session_state["wl_symbol"] == "IONQ"
-    # AppTest has no browser to send the open tab back, so it is set before each run.
-    watch.at.session_state["tabs_main"] = "Trades"
-    watch.run()
-    watch.click("wl_alert_today_IONQ_buy")                    # one alert hidden: the bell counts the rest
-    watch.at.session_state["tabs_main"] = "Trades"
-    assert watch.run().button(key="wl_bell").label == "1"
+    # The tab must hold while the user works in the Watchlist: a list change once opened Overview.
+    at.selectbox(key="wl_list_select").set_value(f"list:{ids['Metals']}")
+    at = watch.run()
+    assert _open_tab(at) == "Watchlist" and at.session_state["wl_list"] == ids["Metals"]
+    assert at.session_state["tabs_main_1"] == "Watchlist"      # a new key per jump: no stale tab comes back
+    _on_tab(watch, "Trades")
+    at = watch.click("wl_alert_today_IONQ_buy")               # one alert hidden: the bell counts the rest
+    assert at.button(key="wl_bell").label == "1"
     at = watch.click("wl_bell")
     assert at.session_state["wl_symbol"] == "QTUM"            # the first alert still shown
+    _on_tab(watch, "Trades")
     watch.click("wl_alert_snooze_QTUM_buy")
-    watch.at.session_state["tabs_main"] = "Trades"
-    watch.run()
     assert not watch.has("wl_bell")                           # every alert hidden: no bell
 
 
