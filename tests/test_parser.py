@@ -109,3 +109,37 @@ def test_cash_transactions_missing_fx_rate_treated_as_base(flex_xml):
     divs = df[df["type"].astype(str) == "DIVIDEND"]
     # The dividend rows carry no fxRateToBase; they are already in base.
     assert list(divs["amount_base"]) == pytest.approx(list(divs["amount"]))
+
+
+def test_symbol_daily_one_row_per_day_and_symbol(stmt):
+    import datetime as dt
+
+    df = parser.symbol_daily_df(stmt)
+    assert list(df.columns) == ["date", "symbol", "description", "price", "mtm_pnl", "currency"]
+    assert len(df) == 4
+    last = df[(df["date"] == dt.date(2024, 12, 31)) & (df["symbol"] == "AAPL")].iloc[0]
+    assert (last["price"], last["mtm_pnl"], last["description"]) == (150.0, 50.0, "APPLE INC")
+
+
+def test_symbol_daily_files_a_temporary_symbol_under_its_underlying():
+    """During a corporate action IBKR lists the old line under a timestamped
+    symbol; the day must still show one XOM row with both amounts."""
+    from tests.conftest import SYNTHETIC_FLEX_XML
+
+    extra = (b'<PriorPeriodPosition symbol="20260701222712XOM" underlyingSymbol="XOM" description="OLD" '
+             b'assetCategory="STK" currency="USD" date="2024-12-31" price="100" priorMtmPnl="1.5"/>'
+             b'<PriorPeriodPosition symbol="XOM" underlyingSymbol="XOM" description="NEW" '
+             b'assetCategory="STK" currency="USD" date="2024-12-31" price="101" priorMtmPnl="2.5"/>')
+    xml = SYNTHETIC_FLEX_XML.replace(b"</PriorPeriodPositions>", extra + b"</PriorPeriodPositions>")
+    df = parser.symbol_daily_df(parser.parse_statement(xml))
+    xom = df[df["symbol"] == "XOM"]
+    assert len(xom) == 1 and xom.iloc[0]["mtm_pnl"] == 4.0
+
+
+def test_symbol_daily_without_the_section_is_an_empty_typed_frame():
+    from tests.conftest import SYNTHETIC_FLEX_XML
+
+    head, rest = SYNTHETIC_FLEX_XML.split(b"<PriorPeriodPositions>")
+    xml = head + rest.split(b"</PriorPeriodPositions>")[1]
+    df = parser.symbol_daily_df(parser.parse_statement(xml))
+    assert df.empty and list(df.columns) == parser.SYMBOL_DAILY_COLS

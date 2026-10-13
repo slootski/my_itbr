@@ -11,6 +11,8 @@ Dividend sections (for the app smoke test and parser tests):
 - Two Deposits & Withdrawals rows, one in ILS (fxRateToBase 0.27) and one in
   USD, so the contributed-capital split is exercised against the currency
   mixing it exists to prevent: 4000 ILS + 500 USD is 1580 base, not 4500.
+- PriorPeriodPositions: AAPL and MSFT on the two equity days, for the per-ticker
+  view of a day (31 Dec: AAPL +3.45%, +50; MSFT -1.00%, -4).
 - OpenDividendAccruals: one AAPL accrual (pay 2025-01-16). Relative to any
   "today" after Jan 2025 it is stale, so it must neither rewrite history (D4)
   nor suppress the red Declare/Pay projection (BUG-10) — the quarterly cadence
@@ -19,7 +21,14 @@ Dividend sections (for the app smoke test and parser tests):
 """
 from __future__ import annotations
 
+import pandas as pd
 import pytest
+import streamlit as st
+
+# Imported here, before any fixture sets the environment: config copies the real
+# .env credentials over os.environ at import, and a first import inside
+# AppTest.run() would overwrite what a test just set.
+import config
 
 SYNTHETIC_FLEX_XML = b"""<?xml version="1.0"?>
 <FlexQueryResponse queryName="t" type="AF">
@@ -47,6 +56,12 @@ SYNTHETIC_FLEX_XML = b"""<?xml version="1.0"?>
 <OpenDividendAccruals>
 <OpenDividendAccrual symbol="AAPL" exDate="2024-12-27" payDate="2025-01-16" grossAmount="26" netAmount="19.5" quantity="10" tax="6.5"/>
 </OpenDividendAccruals>
+<PriorPeriodPositions>
+<PriorPeriodPosition symbol="AAPL" underlyingSymbol="AAPL" description="APPLE INC" assetCategory="STK" currency="USD" date="2024-12-30" price="145" priorMtmPnl="-20"/>
+<PriorPeriodPosition symbol="MSFT" underlyingSymbol="MSFT" description="MICROSOFT CORP" assetCategory="STK" currency="USD" date="2024-12-30" price="400" priorMtmPnl="5"/>
+<PriorPeriodPosition symbol="AAPL" underlyingSymbol="AAPL" description="APPLE INC" assetCategory="STK" currency="USD" date="2024-12-31" price="150" priorMtmPnl="50"/>
+<PriorPeriodPosition symbol="MSFT" underlyingSymbol="MSFT" description="MICROSOFT CORP" assetCategory="STK" currency="USD" date="2024-12-31" price="396" priorMtmPnl="-4"/>
+</PriorPeriodPositions>
 <CashReport>
 <CashReportCurrency currency="USD" endingCash="600" endingSettledCash="600"/>
 </CashReport>
@@ -65,6 +80,62 @@ def _no_polygon_network(monkeypatch):
     pass keys as explicit arguments, so they are unaffected.
     """
     monkeypatch.setenv("POLYGON_API_KEY", "")
+
+
+@pytest.fixture(autouse=True)
+def _no_expense_ratio_network(monkeypatch):
+    """Stub the yfinance expense-ratio lookup for every test.
+
+    The Prices tab asks for it on every run, so any app-path test would otherwise
+    hit the network. Tests that want a ratio patch ``prices.fetch_expense_ratio``
+    again; tests of the lookup itself keep a reference to the real function.
+    """
+    from data import prices
+
+    monkeypatch.setattr(prices, "fetch_expense_ratio", lambda symbol: None)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_store_and_credentials(monkeypatch, tmp_path_factory):
+    """Keep every test away from the developer's database, .env and credentials.
+
+    ``DB_PATH`` and ``config.ENV_PATH`` point at tmp paths, and the Flex
+    credentials are empty unless a test sets them (empty keeps the app on its
+    not-connected path; any made-up value would make it call IBKR).
+    """
+    home = tmp_path_factory.mktemp("store")
+    monkeypatch.setenv("DB_PATH", str(home / "isolated.sqlite"))
+    monkeypatch.setattr(config, "ENV_PATH", home / ".env")
+    monkeypatch.setenv("FLEX_TOKEN", "")
+    monkeypatch.setenv("FLEX_QUERY_ID", "")
+
+
+@pytest.fixture(autouse=True)
+def _clear_streamlit_cache():
+    """st.cache_data is process-wide; a schedule's cache key has no session part,
+    so equal patched times would share an entry between tests."""
+    st.cache_data.clear()
+    yield
+    st.cache_data.clear()
+
+
+@pytest.fixture(autouse=True)
+def _no_yfinance_network(monkeypatch):
+    """Stub every yfinance entry point the app reaches.
+
+    Tests that need prices or quotes patch these again; tests of the functions
+    themselves keep a reference to the real one taken at import.
+    """
+    from data import prices, watchlist
+
+    monkeypatch.setattr(prices, "fetch_ohlc", lambda *args, **kwargs: pd.DataFrame())
+    monkeypatch.setattr(prices, "fetch_quote", lambda symbol: None)
+    monkeypatch.setattr(prices, "fetch_quotes",
+                        lambda symbols, workers: {symbol: None for symbol in symbols})
+    monkeypatch.setattr(
+        prices, "resolve_symbol",
+        lambda text: {"status": "ok", "symbol": watchlist.clean_symbol(text=text)},
+    )
 
 
 @pytest.fixture(autouse=True)

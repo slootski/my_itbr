@@ -94,7 +94,7 @@ def test_parser_emits_section_records(caplog, flex_xml):
 
 def test_flex_logs_query_id_never_token(caplog, monkeypatch):
     token = "SECRET-TOKEN-123456"
-    monkeypatch.setattr(flex.flex_client, "download", lambda t, q: b"<xml/>")
+    monkeypatch.setattr(flex, "_fetch", lambda *, token, query_id, date_range: b"<xml/>")
     with caplog.at_level(logging.DEBUG, logger="myitbr.flex"):
         flex.download_statement(token=token, query_id="qid42", date_range=None)
     records = [r for r in caplog.records if r.name == "myitbr.flex"]
@@ -108,10 +108,10 @@ def test_flex_logs_query_id_never_token(caplog, monkeypatch):
 def test_flex_failure_log_scrubs_token(caplog, monkeypatch):
     token = "SECRET-TOKEN-123456"
 
-    def _boom(t, q):
+    def _boom(*, token, query_id, date_range):
         raise RuntimeError(f"GET https://ibkr/Send?t={token}&q=qid42 timed out")
 
-    monkeypatch.setattr(flex.flex_client, "download", _boom)
+    monkeypatch.setattr(flex, "_fetch", _boom)
     with caplog.at_level(logging.DEBUG, logger="myitbr.flex"):
         with pytest.raises(flex.FlexError):
             flex.download_statement(token=token, query_id="qid42", date_range=None)

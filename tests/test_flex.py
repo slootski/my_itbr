@@ -29,10 +29,10 @@ def test_response_code_error_is_wrapped(monkeypatch):
             self.code = "1003"
             self.message = "Invalid token"
 
-    def _boom(token, query_id):
+    def _boom(*, token, query_id, date_range):
         raise _RCE()
 
-    monkeypatch.setattr(flex.flex_client, "download", _boom)
+    monkeypatch.setattr(flex, "_fetch", _boom)
     with pytest.raises(flex.FlexError) as exc:
         flex.download_statement(token="tok", query_id="qid", date_range=None)
     assert "1003" in str(exc.value)
@@ -40,17 +40,17 @@ def test_response_code_error_is_wrapped(monkeypatch):
 
 
 def test_generic_error_is_wrapped(monkeypatch):
-    def _boom(token, query_id):
+    def _boom(*, token, query_id, date_range):
         raise RuntimeError("network down")
 
-    monkeypatch.setattr(flex.flex_client, "download", _boom)
+    monkeypatch.setattr(flex, "_fetch", _boom)
     with pytest.raises(flex.FlexError) as exc:
         flex.download_statement(token="tok", query_id="qid", date_range=None)
     assert "network down" in str(exc.value)
 
 
 def test_success_returns_bytes(monkeypatch):
-    monkeypatch.setattr(flex.flex_client, "download", lambda t, q: b"<xml/>")
+    monkeypatch.setattr(flex, "_fetch", lambda *, token, query_id, date_range: b"<xml/>")
     assert flex.download_statement(token="tok", query_id="qid", date_range=None) == b"<xml/>"
 
 
@@ -58,7 +58,7 @@ def _counting_download(errors: list[Exception | bytes]):
     """Return a fake download that yields `errors` in order, raising Exceptions."""
     calls: list[int] = []
 
-    def _fake(token, query_id):
+    def _fake(*, token, query_id, date_range):
         calls.append(1)
         item = errors[len(calls) - 1]
         if isinstance(item, Exception):
@@ -73,7 +73,7 @@ def test_connection_error_is_retried_then_succeeds(monkeypatch):
         requests.exceptions.ConnectionError("Failed to resolve 'gdcdyn...'"),
         b"<xml/>",
     ])
-    monkeypatch.setattr(flex.flex_client, "download", fake)
+    monkeypatch.setattr(flex, "_fetch", fake)
     assert flex.download_statement(token="tok", query_id="qid", date_range=None) == b"<xml/>"
     assert len(calls) == 2
 
@@ -84,7 +84,7 @@ def test_timeout_is_retried(monkeypatch):
         requests.exceptions.Timeout("timed out"),
         b"<xml/>",
     ])
-    monkeypatch.setattr(flex.flex_client, "download", fake)
+    monkeypatch.setattr(flex, "_fetch", fake)
     assert flex.download_statement(token="tok", query_id="qid", date_range=None) == b"<xml/>"
     assert len(calls) == 3
 
@@ -93,7 +93,7 @@ def test_retries_are_bounded(monkeypatch):
     fake, calls = _counting_download(
         [requests.exceptions.ConnectionError("dns down")] * flex.MAX_ATTEMPTS
     )
-    monkeypatch.setattr(flex.flex_client, "download", fake)
+    monkeypatch.setattr(flex, "_fetch", fake)
     with pytest.raises(flex.FlexError) as exc:
         flex.download_statement(token="tok", query_id="qid", date_range=None)
     assert len(calls) == flex.MAX_ATTEMPTS
@@ -108,7 +108,7 @@ def test_response_code_error_is_not_retried(monkeypatch):
             self.message = "Token is invalid."
 
     fake, calls = _counting_download([_RCE(), b"<xml/>"])
-    monkeypatch.setattr(flex.flex_client, "download", fake)
+    monkeypatch.setattr(flex, "_fetch", fake)
     with pytest.raises(flex.FlexError):
         flex.download_statement(token="tok", query_id="qid", date_range=None)
     assert len(calls) == 1
@@ -116,7 +116,7 @@ def test_response_code_error_is_not_retried(monkeypatch):
 
 def test_non_transport_error_is_not_retried(monkeypatch):
     fake, calls = _counting_download([RuntimeError("malformed xml"), b"<xml/>"])
-    monkeypatch.setattr(flex.flex_client, "download", fake)
+    monkeypatch.setattr(flex, "_fetch", fake)
     with pytest.raises(flex.FlexError):
         flex.download_statement(token="tok", query_id="qid", date_range=None)
     assert len(calls) == 1
@@ -128,10 +128,10 @@ def test_response_code_error_carries_code(monkeypatch):
             self.code = "1012"
             self.message = "Token has expired."
 
-    def _boom(token, query_id):
+    def _boom(*, token, query_id, date_range):
         raise _RCE()
 
-    monkeypatch.setattr(flex.flex_client, "download", _boom)
+    monkeypatch.setattr(flex, "_fetch", _boom)
     with pytest.raises(flex.FlexError) as exc:
         flex.download_statement(token="tok", query_id="qid", date_range=None)
     assert exc.value.code == flex.TOKEN_EXPIRED
@@ -139,10 +139,10 @@ def test_response_code_error_carries_code(monkeypatch):
 
 
 def test_non_response_errors_have_no_code(monkeypatch):
-    def _boom(token, query_id):
+    def _boom(*, token, query_id, date_range):
         raise ValueError("garbage xml")
 
-    monkeypatch.setattr(flex.flex_client, "download", _boom)
+    monkeypatch.setattr(flex, "_fetch", _boom)
     with pytest.raises(flex.FlexError) as exc:
         flex.download_statement(token="tok", query_id="qid", date_range=None)
     assert exc.value.code is None
@@ -165,21 +165,135 @@ _RANGE = (dt.date(2025, 9, 26), dt.date(2026, 9, 25))
 
 
 def test_range_request_sends_fd_td_and_polls(monkeypatch):
+    sent: list[tuple[str, dict]] = []
+
+    def fake_get(url, params, headers, timeout):
+        sent.append((url, params))
+        return _Resp(_ACCESS_OK if "SendRequest" in url else b"<FlexQueryResponse/>")
+
+    monkeypatch.setattr(flex.requests, "get", fake_get)
+    out = flex.download_statement(token="tok", query_id="qid", date_range=_RANGE)
+    assert out == b"<FlexQueryResponse/>"
+    send_params = sent[0][1]
+    assert send_params["fd"] == "20250926" and send_params["td"] == "20260925"
+    assert send_params["q"] == "qid"
+    assert sent[1] == ("https://ibkr/GetStatement", {"v": "3", "t": "tok", "q": "REF1"})
+
+
+def test_query_period_request_omits_fd_td(monkeypatch):
     sent: list[dict] = []
 
     def fake_get(url, params, headers, timeout):
         sent.append(params)
-        return _Resp(_ACCESS_OK)
+        return _Resp(_ACCESS_OK if "SendRequest" in url else b"<FlexQueryResponse/>")
 
     monkeypatch.setattr(flex.requests, "get", fake_get)
-    monkeypatch.setattr(flex.flex_client, "submit_request",
-                        lambda url, token, query: _Resp(b"<FlexQueryResponse/>"))
-    monkeypatch.setattr(flex.flex_client, "download",
-                        lambda t, q: pytest.fail("range pull must not use the query period"))
+    out = flex.download_statement(token="tok", query_id="qid", date_range=None)
+    assert out == b"<FlexQueryResponse/>"
+    assert sent[0] == {"v": "3", "t": "tok", "q": "qid"}
+
+
+# ---- host failover (gdcdyn <-> ndcdyn) -------------------------------------
+
+_GDC = "https://gdcdyn.interactivebrokers.com/AccountManagement/FlexWebService"
+_NDC = "https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService"
+_ACCESS_GDC = _ACCESS_OK.replace(b"https://ibkr/GetStatement", f"{_GDC}/GetStatement".encode())
+
+
+def _fake_get_with_dead_host(dead_host: str, calls: list[str]):
+    """requests.get that fails DNS for ``dead_host`` and answers on any other host."""
+    def _fake(url, params, headers, timeout):
+        calls.append(url)
+        if dead_host in url:
+            raise requests.exceptions.ConnectionError(f"Failed to resolve '{dead_host}'")
+        return _Resp(_ACCESS_GDC if "SendRequest" in url else b"<FlexQueryResponse/>")
+    return _fake
+
+
+def test_statement_fails_over_from_default_host_to_new_host(monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(flex.requests, "get",
+                        _fake_get_with_dead_host("gdcdyn.interactivebrokers.com", calls))
+    out = flex.download_statement(token="tok", query_id="qid", date_range=None)
+    assert out == b"<FlexQueryResponse/>"
+    assert calls == [
+        f"{_NDC}/SendRequest",
+        f"{_GDC}/GetStatement",
+        f"{_NDC}/GetStatement",
+    ]
+
+
+def test_send_request_fails_over_from_new_host_to_default_host(monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(flex.requests, "get",
+                        _fake_get_with_dead_host("ndcdyn.interactivebrokers.com", calls))
     out = flex.download_statement(token="tok", query_id="qid", date_range=_RANGE)
     assert out == b"<FlexQueryResponse/>"
-    assert sent[0]["fd"] == "20250926" and sent[0]["td"] == "20260925"
-    assert sent[0]["q"] == "qid"
+    assert calls == [
+        f"{_NDC}/SendRequest",
+        f"{_GDC}/SendRequest",
+        f"{_GDC}/GetStatement",
+    ]
+
+
+def test_all_hosts_down_uses_outer_retry_then_fails(monkeypatch):
+    calls: list[str] = []
+
+    def fake_get(url, params, headers, timeout):
+        calls.append(url)
+        raise requests.exceptions.ConnectionError("dns down")
+
+    monkeypatch.setattr(flex.requests, "get", fake_get)
+    with pytest.raises(flex.FlexError) as exc:
+        flex.download_statement(token="tok", query_id="qid", date_range=None)
+    assert len(calls) == flex.MAX_ATTEMPTS * len(flex.FLEX_HOSTS)
+    assert f"after {flex.MAX_ATTEMPTS} attempts" in str(exc.value)
+
+
+def test_response_code_error_does_not_fail_over(monkeypatch):
+    calls: list[str] = []
+
+    def fake_get(url, params, headers, timeout):
+        calls.append(url)
+        return _Resp(_ACCESS_1003)
+
+    monkeypatch.setattr(flex.requests, "get", fake_get)
+    with pytest.raises(flex.FlexError):
+        flex.download_statement(token="tok", query_id="qid", date_range=None)
+    assert calls == [f"{_NDC}/SendRequest"]
+
+
+def test_failover_warning_scrubs_token(caplog, monkeypatch):
+    token = "SECRET-TOKEN-123456"
+    calls: list[str] = []
+
+    def fake_get(url, params, headers, timeout):
+        calls.append(url)
+        if len(calls) == 1:
+            raise requests.exceptions.ConnectionError(f"GET {url}?t={params['t']} failed")
+        return _Resp(_ACCESS_GDC if "SendRequest" in url else b"<FlexQueryResponse/>")
+
+    monkeypatch.setattr(flex.requests, "get", fake_get)
+    with caplog.at_level(logging.DEBUG, logger="myitbr.flex"):
+        flex.download_statement(token=token, query_id="qid", date_range=None)
+    joined = " ".join(r.getMessage() for r in caplog.records if r.name == "myitbr.flex")
+    assert "unreachable" in joined
+    assert token not in joined
+
+
+def test_unknown_statement_host_is_tried_first_then_flex_hosts(monkeypatch):
+    calls: list[str] = []
+
+    def fake_get(url, params, headers, timeout):
+        calls.append(url)
+        if url.startswith("https://ibkr/"):
+            raise requests.exceptions.ConnectionError("dns down")
+        return _Resp(_ACCESS_OK if "SendRequest" in url else b"<FlexQueryResponse/>")
+
+    monkeypatch.setattr(flex.requests, "get", fake_get)
+    assert flex.download_statement(token="tok", query_id="qid", date_range=None) == b"<FlexQueryResponse/>"
+    assert calls == [f"{_NDC}/SendRequest", "https://ibkr/GetStatement",
+                     "https://gdcdyn.interactivebrokers.com/GetStatement"]
 
 
 def test_range_error_status_carries_code_and_is_not_retried(monkeypatch):
@@ -206,8 +320,12 @@ def test_range_polling_is_bounded(monkeypatch):
         polls.append(1)
         return _Resp(busy)
 
-    monkeypatch.setattr(flex.requests, "get", lambda url, params, headers, timeout: _Resp(_ACCESS_OK))
-    monkeypatch.setattr(flex.flex_client, "submit_request", fake_submit)
+    def fake_get(url, params, headers, timeout):
+        if "SendRequest" in url:
+            return _Resp(_ACCESS_OK)
+        return fake_submit(url, params["t"], params["q"])
+
+    monkeypatch.setattr(flex.requests, "get", fake_get)
     with pytest.raises(flex.FlexError):
         flex.download_statement(token="tok", query_id="qid", date_range=_RANGE)
     assert len(polls) == flex.MAX_POLLS

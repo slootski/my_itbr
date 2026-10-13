@@ -37,3 +37,20 @@ def test_read_missing_returns_empty_typed_frame(tmp_path):
     df = snapshots.read_history(tmp_path / "nope.sqlite")
     assert df.empty
     assert list(df.columns) == ["snapshot_date", "ts", "net_liq", "cash", "currency"]
+
+
+def test_read_equity_daily_missing_db_returns_empty_typed_frame(tmp_path):
+    df = snapshots.read_equity_daily(db_path=tmp_path / "nope.sqlite")
+    assert df.empty
+    assert list(df.columns) == ["report_date", "net_liq", "cash", "stock", "currency"]
+
+
+def test_read_equity_daily_empty_table(db_path):
+    snapshots.init_db(db_path)
+    assert snapshots.read_equity_daily(db_path=db_path).empty
+
+
+def test_read_symbol_daily_missing_db_returns_empty_typed_frame(tmp_path):
+    df = snapshots.read_symbol_daily(db_path=tmp_path / "nope.sqlite")
+    assert df.empty
+    assert list(df.columns) == ["date", "symbol", "description", "price", "mtm_pnl", "currency"]

@@ -72,9 +72,21 @@ snapshot for the Net Worth tab.
 - **Prices** — candlestick + volume (yfinance) for a held symbol, plus a KPI grid
   (current price and day change, my average cost and unrealized P&L, period and
   52-week ranges, volatility/ATR/average volume, and total dividends received for
-  that symbol with yield on price and on cost). Optional chart overlays — average
+  that symbol with yield on price and on cost, and a fund's expense ratio with
+  what it takes from the holding per year). Optional chart overlays — average
   cost line, MA20/MA50, period mean, buy/sell trade markers — each toggleable.
+- **Watchlist** — named lists of stocks (any yfinance ticker, held or not), each with an
+  optional buy and sell target. A table of the list shows the delayed intraday price, the
+  day change and how far the price is from each target; picking a row (its circle, or ▲ ▼)
+  shows the Prices-style tiles and chart with the target lines. Stocks can be added,
+  moved between lists and removed. While a price is at or below its buy target, or at or
+  above its sell target, a **Watchlist alerts** box shows at the top of Overview. Prices
+  are fetched when the app opens; **Update schedule** can re-fetch every N minutes, for a
+  number of hours or with no end time (only while the page is open), and **Update now**
+  fetches at once. Lists and targets live in the SQLite store, and every change refreshes
+  the day's backup. The tab also works when IBKR is not connected.
 - **Dividends** — per-ticker / per-month dividend projection calendar (see below).
+- **Performance** — daily performance calendar (see below).
 - **Net Worth** — NAV line over time from local SQLite snapshots.
 
 ## Local archive — surviving the rolling Flex window
@@ -107,8 +119,13 @@ tests: `tests/test_history.py`.
 ### Backups
 
 Each refresh drops a dated copy in `BACKUP_DIR` (default `db/backups/`), keeping
-the newest `BACKUP_KEEP` (default 14) and pruning the rest. One per day — a second
+the newest `BACKUP_KEEP` (default 14) days and pruning the rest. One per day — a second
 refresh the same day reuses the existing copy.
+
+Watchlists and targets are typed by hand and cannot be pulled from IBKR again, so
+every watchlist change rewrites the day's file. The copy taken before the day's first
+IBKR write is kept beside it as `snapshots-<day>-presync.sqlite` and is pruned with
+its day.
 
 Copies are made with `VACUUM INTO`, not a file copy, so a backup taken while
 Streamlit holds the database open is always internally consistent, never a torn
@@ -136,7 +153,9 @@ Implementation: `data/backup.py`, tests: `tests/test_backup.py`.
 ## Dividend calendar — how it works
 
 Rows are held tickers, then tickers you sold that paid (marked **sold**: past
-payments only, never projected). Columns are months ("Mon YYYY"); the
+payments only, never projected). A sold ticker is listed only when the months
+shown include a dividend or a trade of it, so one sold before the period does
+not appear in it. Columns are months ("Mon YYYY"); the
 current-month column is highlighted and always present.
 
 **One definition of dividend income.** `data/div_ledger.py` is the only code
@@ -205,6 +224,57 @@ The reference mockup for this behavior lives at
 (Polygon) and `data/div_external.py` (yfinance), rendering: `tab_dividends` in
 `app.py`, tests: `tests/test_dividends.py` + `tests/test_div_provider.py`.
 
+## Performance calendar — how each day is measured
+
+One cell per trading day (Mon–Fri columns plus a **Week** total; weekends are
+not drawn). The large figure is the day's return, the amount under it is the
+profit or loss in base currency.
+
+A **Period** slider with two handles picks the months, `◀ ▶` slide the period
+by a month, and quick periods (1M, 3M, 6M, 1Y, YTD, All) set it in one click.
+One month shows its days; several months show one row per month, with a
+line of the running return day by day (linked daily returns, from 0% at the
+month's start, each row on its own scale) and the month's return, P&L and
+fees, and clicking a row opens that month. The line has one point per day with
+a close; days without one are skipped. The number at each point is that day's
+own return in percent (not shown when the chart is too narrow for them).
+
+Hovering a day shows its numbers and the **best and worst ticker** of the day,
+ranked by price change. **Clicking a day** opens its details: P&L per ticker as
+a bar chart and a table, how much of the day came from shares already held
+versus everything else, the day's cash events and its trades. The metrics above
+(return, P&L, best and worst day, up days, fees) always cover the chosen period.
+
+- A day is measured from the previous end-of-day close to its own close:
+  `pnl = nav - prev_nav - flow`, `return = nav / (prev_nav + flow) - 1`.
+- `flow` is deposits and withdrawals, dated by IBKR's **report date** (the day
+  NAV moves), so adding money never looks like a gain. Dividends and interest
+  are part of the return.
+- **Fees** (a metric, a row in the day's hover panel and a column in the daily
+  table) are trade commissions plus fee-type cash transactions. They are
+  already inside the profit or loss; the figure is a breakdown, not a deduction.
+- Week, month and year returns link the daily returns (time-weighted); they are
+  not a sum of percents. This is why a period can show a money gain and a
+  negative return, or the reverse, when deposits changed the account's size.
+- Direction is shown three ways (tint hue, arrow, sign) and size by four fixed
+  tint steps (0.25%, 0.75%, 1.5%), so the calendar does not rely on colour.
+- **No data**: a weekday with no close; the next day's figure covers both.
+  **Pending**: no close yet. A ring marks a deposit or withdrawal day.
+
+Closes come from the statement's `EquitySummaryInBase` and are stored in the
+insert-only table `equity_daily`, so days older than the Flex window keep their
+true value. `nav_snapshots` is not used for this: its live-pull rows hold the
+latest figure under the pull date, which is not that day's close.
+
+Per-ticker figures come from the statement's `PriorPeriodPositions` (closing
+price and mark-to-market P&L per symbol per day) and are stored in the
+insert-only table `symbol_daily` for the same reason. That P&L covers shares
+held coming into the day; shares traded that day are in "everything else".
+
+Implementation: `data/performance.py` (calculation), `charts/perf_calendar.py`
+(markup), `tab_performance` in `app.py`; tests: `tests/test_performance.py`,
+`tests/test_perf_calendar.py`.
+
 ## Notes
 
 - `.env` is gitignored; never commit secrets. Ship `.env.example`.
@@ -213,6 +283,9 @@ The reference mockup for this behavior lives at
   guidance: Account Management → Reporting → Flex Web Service → Generate a
   new token → paste into `.env` as `FLEX_TOKEN` → Refresh data. Local NAV
   history stays available meanwhile.
+- After a failed IBKR download the app does not ask IBKR again by itself: press
+  **Refresh data** (or save a new token) to retry. The Watchlist and Net Worth tabs
+  keep working meanwhile.
 - Flex carries no live/historical prices; the Prices tab uses yfinance instead.
 - Polygon is optional and only queried for the tickers that need it (cached per
   refresh); on the free tier a rate limit just degrades to the yfinance fallback.

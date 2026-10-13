@@ -40,6 +40,19 @@ _NAV_NUMS = {"net_liq", "cash"}
 # Statement-derived NAV rows carry this time part (see history.backfill_nav).
 _STATEMENT_TS_SUFFIX = "T00:00:00"
 
+# equity_daily value columns (everything but the report_date key).
+_EQUITY_COLS = [c for c in snapshots.EQUITY_DAILY_COLS if c != "report_date"]
+_EQUITY_NUMS = {"net_liq", "cash", "stock"}
+
+# symbol_daily value columns (the key is "<date>|<symbol>").
+_SYMBOL_COLS = snapshots.SYMBOL_DAILY_COLS
+_SYMBOL_NUMS = {"price", "mtm_pnl"}
+# The key columns can never differ on a row found by its key.
+_SYMBOL_COMPARE_COLS = [c for c in _SYMBOL_COLS if c not in ("date", "symbol")]
+# Tables whose added rows are counted in the log, not listed: one load can add
+# thousands, which would push the rest of the history out of the rotating log.
+_BULK_TABLES = frozenset({"symbol_daily"})
+
 
 def _table_specs() -> list[dict]:
     """Archive tables in the same shape ``history._record`` writes them."""
@@ -169,6 +182,78 @@ def _plan_nav(
     return out
 
 
+def _plan_equity(*, conn: sqlite3.Connection, equity: pd.DataFrame, currency: str | None) -> dict:
+    """End-of-day closes the statement has and ``equity_daily`` lacks.
+
+    Statement rows only: today's live figure is not a close and never goes in.
+    """
+    out = {"missing": [], "fills": [], "diffs": []}
+    if equity is None or equity.empty or "report_date" not in equity:
+        return out
+    incoming: dict[str, dict] = {}
+    for row in equity.to_dict("records"):
+        date_iso = history._iso(value=row.get("report_date"))
+        if not date_iso:
+            continue
+        incoming[date_iso[:10]] = {
+            "net_liq": history._num(value=row.get("net_liq")),
+            "cash": history._num(value=row.get("cash")),
+            "stock": history._num(value=row.get("stock")),
+            "currency": currency,
+        }
+
+    existing = {
+        record[0]: dict(zip(_EQUITY_COLS, record[1:]))
+        for record in conn.execute(
+            f"SELECT report_date, {', '.join(_EQUITY_COLS)} FROM equity_daily")
+    }
+    for date_iso, row in sorted(incoming.items()):
+        label = {"date": date_iso, "symbol": None, "type": "CLOSE", "amount": row["net_liq"]}
+        db_row = existing.get(date_iso)
+        if db_row is None:
+            out["missing"].append({"key": date_iso, "row": row, **label})
+        else:
+            _compare(key=date_iso, db_row=db_row, new_row=row, cols=_EQUITY_COLS,
+                     nums=_EQUITY_NUMS, fills=out["fills"], diffs=out["diffs"],
+                     table="equity_daily", label=label)
+    return out
+
+
+def _plan_symbols(*, conn: sqlite3.Connection, symbols: pd.DataFrame | None) -> dict:
+    """Per-symbol days the statement has and ``symbol_daily`` lacks."""
+    out = {"missing": [], "fills": [], "diffs": []}
+    if symbols is None or symbols.empty or "date" not in symbols or "symbol" not in symbols:
+        return out
+    incoming: dict[str, dict] = {}
+    for row in symbols.to_dict("records"):
+        date_iso, symbol = history._iso(value=row.get("date")), history._text(value=row.get("symbol"))
+        if not date_iso or not symbol:
+            continue
+        date_iso = date_iso[:10]
+        incoming[f"{date_iso}|{symbol}"] = {
+            "date": date_iso, "symbol": symbol,
+            "description": history._text(value=row.get("description")),
+            "price": history._num(value=row.get("price")),
+            "mtm_pnl": history._num(value=row.get("mtm_pnl")),
+            "currency": history._text(value=row.get("currency")),
+        }
+
+    existing = {
+        record[0]: dict(zip(_SYMBOL_COLS, record[1:]))
+        for record in conn.execute(f"SELECT day_key, {', '.join(_SYMBOL_COLS)} FROM symbol_daily")
+    }
+    for key, row in sorted(incoming.items()):
+        label = {"date": row["date"], "symbol": row["symbol"], "type": "MTM", "amount": row["mtm_pnl"]}
+        db_row = existing.get(key)
+        if db_row is None:
+            out["missing"].append({"key": key, "row": row, **label})
+        else:
+            _compare(key=key, db_row=db_row, new_row=row, cols=_SYMBOL_COMPARE_COLS,
+                     nums=_SYMBOL_NUMS, fills=out["fills"], diffs=out["diffs"],
+                     table="symbol_daily", label=label)
+    return out
+
+
 def make_window(
     *, requested: tuple[dt.date, dt.date] | None, returned_from, returned_to,
 ) -> dict:
@@ -195,6 +280,7 @@ def plan(
     trades: pd.DataFrame,
     cash_tx: pd.DataFrame,
     equity: pd.DataFrame,
+    symbols: pd.DataFrame | None,
     nav: dict,
     window: dict,
     today: str,
@@ -204,7 +290,7 @@ def plan(
 
     Returns plain dicts and lists (st.cache_data serializable)::
 
-        {"tables": {"trades"|"cash_tx"|"nav_snapshots":
+        {"tables": {"trades"|"cash_tx"|"nav_snapshots"|"equity_daily"|"symbol_daily":
                        {"missing": [...], "fills": [...], "diffs": [...]}},
          "window": {...}, "written": 0, "error": None}
     """
@@ -213,6 +299,8 @@ def plan(
         tables = {spec["name"]: _plan_archive(conn=conn, spec=spec, df=df)
                   for spec, df in zip(_table_specs(), (trades, cash_tx))}
         tables["nav_snapshots"] = _plan_nav(conn=conn, equity=equity, nav=nav, today=today, now=now)
+        tables["equity_daily"] = _plan_equity(conn=conn, equity=equity, currency=nav.get("currency"))
+        tables["symbol_daily"] = _plan_symbols(conn=conn, symbols=symbols)
     return {"tables": tables, "window": window, "written": 0, "error": None}
 
 
@@ -273,6 +361,40 @@ def apply(*, db_path: Path | str, report: dict, today: str) -> int:
                     (fill["value"], fill["key"]),
                 )
                 written += max(cur.rowcount, 0)
+
+            closes = tables["equity_daily"]
+            for item in closes["missing"]:
+                row = item["row"]
+                cur = conn.execute(
+                    f"INSERT INTO equity_daily (report_date, {', '.join(_EQUITY_COLS)}, first_seen) "
+                    "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(report_date) DO NOTHING",
+                    (item["key"], *[row[c] for c in _EQUITY_COLS], today),
+                )
+                written += max(cur.rowcount, 0)
+            for fill in closes["fills"]:
+                cur = conn.execute(
+                    f"UPDATE equity_daily SET {fill['column']} = ? "
+                    f"WHERE report_date = ? AND {fill['column']} IS NULL",
+                    (fill["value"], fill["key"]),
+                )
+                written += max(cur.rowcount, 0)
+
+            per_symbol = tables["symbol_daily"]
+            placeholders = ", ".join(["?"] * (len(_SYMBOL_COLS) + 2))
+            for item in per_symbol["missing"]:
+                cur = conn.execute(
+                    f"INSERT INTO symbol_daily (day_key, {', '.join(_SYMBOL_COLS)}, first_seen) "
+                    f"VALUES ({placeholders}) ON CONFLICT(day_key) DO NOTHING",
+                    (item["key"], *[item["row"][c] for c in _SYMBOL_COLS], today),
+                )
+                written += max(cur.rowcount, 0)
+            for fill in per_symbol["fills"]:
+                cur = conn.execute(
+                    f"UPDATE symbol_daily SET {fill['column']} = ? "
+                    f"WHERE day_key = ? AND {fill['column']} IS NULL",
+                    (fill["value"], fill["key"]),
+                )
+                written += max(cur.rowcount, 0)
     finally:
         conn.close()
     return written
@@ -291,7 +413,7 @@ def log_report(*, report: dict) -> None:
         report["written"], f" | error: {report['error']}" if report["error"] else "",
     )
     for name, part in report["tables"].items():
-        for item in part["missing"]:
+        for item in ([] if name in _BULK_TABLES else part["missing"]):
             logger.info("sync: missing %s %s %s %s %s", name, item["date"], item["symbol"] or "",
                         item["type"] or "", item["amount"])
         for fill in part["fills"]:

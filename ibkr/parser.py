@@ -262,6 +262,33 @@ def equity_summary_df(stmt) -> pd.DataFrame:
     return df
 
 
+SYMBOL_DAILY_COLS = ["date", "symbol", "description", "price", "mtm_pnl", "currency"]
+
+
+def symbol_daily_df(stmt) -> pd.DataFrame:
+    """Per day and symbol: the closing price and the day's mark-to-market P&L.
+
+    From the statement's ``PriorPeriodPositions`` section. ``mtm_pnl`` is IBKR's
+    ``priorMtmPnl``: the gain or loss on the shares held coming into that day,
+    in the position's currency. It leaves out shares bought or sold that day.
+    A security IBKR lists under a temporary symbol during a corporate action is
+    filed under its underlying symbol, so a day has one row per symbol
+    (P&L summed, the last price kept).
+    """
+    fields = ["date", "symbol", "underlyingSymbol", "description", "price", "priorMtmPnl", "currency"]
+    df = _records_to_df(getattr(stmt, "PriorPeriodPositions", None), fields)
+    if df.empty:
+        return pd.DataFrame(columns=SYMBOL_DAILY_COLS)
+    df["symbol"] = df["underlyingSymbol"].where(df["underlyingSymbol"].astype(bool), df["symbol"])
+    df = df.rename(columns={"priorMtmPnl": "mtm_pnl"}).dropna(subset=["date", "symbol"])
+    df = (df.groupby(["date", "symbol"], as_index=False)
+          .agg(description=("description", "last"), price=("price", "last"),
+               mtm_pnl=("mtm_pnl", "sum"), currency=("currency", "last")))
+    df = df.sort_values(["date", "symbol"]).reset_index(drop=True)
+    logger.info("symbol_daily: %d rows (date %s)", len(df), _span(df, "date"))
+    return df[SYMBOL_DAILY_COLS]
+
+
 def latest_nav(stmt) -> dict:
     """Best-effort current net liquidation + cash in base currency.
 

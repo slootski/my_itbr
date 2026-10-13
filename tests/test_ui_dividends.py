@@ -143,6 +143,26 @@ def test_d4_held_ticker_without_data_renders_placeholder_row():
     assert body.count("<tr>") == 2  # GRN data row + NEW placeholder row
 
 
+def test_ticker_without_dividends_shows_its_trades_in_month_cells():
+    # NEW pays nothing but was bought: the row gets one cell per month, with the
+    # buy marker in its month, instead of the full-width placeholder.
+    cash_tx = pd.DataFrame([_div_row("GRN", 50.0, dt.date(2026, 2, 20), dt.date(2026, 3, 15))])
+    cal = dividends.build_calendar(_positions("GRN", "NEW"), cash_tx, pd.DataFrame(), today=TODAY)
+    cols = list(cal.values.columns)
+    marks = {"NEW": {cols[1]: [{"side": "BUY", "date": dt.date(2026, 1, 1), "quantity": 3.0,
+                                "price": 10.0, "amount": 30.0, "commission": 1.0,
+                                "realized_pnl": None, "currency": "USD", "fills": 1,
+                                "pos": 0.1, "holding": 3.0}]}}
+    body = _section(app._calendar_html(cal, dark=False, marks=marks), "tbody")
+    (row,) = [r for r in body.split("</tr>") if "<th>NEW" in r]
+    assert 'class="nodata"' not in row and "colspan" not in row
+    assert '<span class="nodiv">no dividends</span>' in row
+    cells = re.findall(r"<td[^>]*>(.*?)</td>", row)[1:]  # drop the Total cell
+    assert len(cells) == len(cols)
+    assert [i for i, cell in enumerate(cells) if 'class="trade buy"' in cell] == [1]
+    assert "Bought 3 sh</b> · 01-01-2026" in cells[1]
+
+
 def test_d6_red_cells_render_words_only_never_amounts():
     for net in (False, True):  # identical in both tax modes
         html_doc = app._calendar_html(_composite_calendar(net=net), dark=False, marks={})
@@ -286,15 +306,34 @@ def test_d13_lookback_all_shows_full_history(div_at):
 def test_buy_marker_renders_with_hover_details():
     cal = _composite_calendar()
     sym, col = cal.values.index[0], cal.values.columns[0]
-    marks = {sym: {col: [{"date": dt.date(2026, 1, 1), "quantity": 3.0, "price": 10.0,
-                          "cost": 30.0, "commission": 1.0, "currency": "USD", "fills": 1,
+    marks = {sym: {col: [{"side": "BUY", "date": dt.date(2026, 1, 1), "quantity": 3.0,
+                          "price": 10.0, "amount": 30.0, "commission": 1.0,
+                          "realized_pnl": None, "currency": "USD", "fills": 1,
                           "pos": 0.1, "holding": 7.456}]}}
     html_doc = app._calendar_html(cal, dark=False, marks=marks)
-    assert html_doc.count('class="buy"') == 1
+    assert html_doc.count('class="trade buy"') == 1
+    assert 'class="trade sell"' not in html_doc
     assert "Bought 3 sh</b> · 01-01-2026" in html_doc
     assert "Price: 10.00 USD" in html_doc and "Cost: 30.00 USD" in html_doc
     assert "Holding after: 7.46 sh" in html_doc
-    assert "Bought (hover for details)" in html_doc  # legend entry
+    assert "Realized P&amp;L" not in html_doc
+    assert "Bought</span>" in html_doc and "Sold (hover a marker for details)" in html_doc  # legend
+
+
+def test_sell_marker_renders_red_with_proceeds_and_realized_pnl():
+    cal = _composite_calendar()
+    sym, col = cal.values.index[0], cal.values.columns[0]
+    marks = {sym: {col: [{"side": "SELL", "date": dt.date(2026, 1, 5), "quantity": 2.0,
+                          "price": 12.0, "amount": 24.0, "commission": 1.0,
+                          "realized_pnl": 4.0, "currency": "USD", "fills": 2,
+                          "pos": 0.2, "holding": 0.0}]}}
+    html_doc = app._calendar_html(cal, dark=False, marks=marks)
+    assert html_doc.count('class="trade sell"') == 1
+    assert "Sold 2 sh</b> · 05-01-2026" in html_doc
+    assert "Proceeds: 24.00 USD" in html_doc and "Cost:" not in html_doc
+    assert "Realized P&amp;L: 4.00 USD" in html_doc
+    assert "2 fills (average price)" in html_doc
+    assert "--sell:" in html_doc
 
 
 def test_ticker_label_shows_shares_held_now():

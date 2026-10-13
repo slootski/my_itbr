@@ -6,6 +6,7 @@ IBKR; the sidebar Refresh button clears the cache to force a fresh pull.
 """
 from __future__ import annotations
 
+import calendar
 import datetime as dt
 import html
 import logging
@@ -16,11 +17,11 @@ import streamlit as st
 from streamlit.delta_generator import DeltaGenerator
 
 import logsetup
-from charts import figures
+from charts import figures, perf_calendar
 from config import ENV_PATH, is_real_value, load_settings, save_env_values, validate_credentials
 from data import (
-    backup, capital, div_external, div_provider, dividends, history, price_stats,
-    prices, snapshots, sync,
+    backup, capital, div_external, div_provider, dividends, history, performance,
+    price_stats, prices, snapshots, sync, watchlist,
 )
 from ibkr import flex, parser
 
@@ -40,6 +41,9 @@ settings = load_settings()
 # pulls again, while widget reruns inside a session reuse the pull. Bounded so
 # old sessions' entries do not pile up in memory.
 _SESSION_KEY = "load_session"
+# The last IBKR failure of this session. While it is set the app does not ask
+# IBKR again; only "Refresh data" or a newly saved token clears it.
+_FLEX_FAILED = "flex_failed"
 _MAX_CACHED_SESSIONS = 4
 
 
@@ -98,6 +102,7 @@ def load_portfolio(token: str, query_id: str, db_path_str: str, session: str) ->
     equity = parser.equity_summary_df(stmt)
     trades = parser.trades_df(stmt)
     cash_tx = parser.cash_transactions_df(stmt)
+    symbols = parser.symbol_daily_df(stmt)
     window = sync.make_window(
         requested=requested,
         returned_from=getattr(stmt, "fromDate", None),
@@ -110,7 +115,7 @@ def load_portfolio(token: str, query_id: str, db_path_str: str, session: str) ->
     # in-window frames stay the fallback.
     trades, cash_tx, report = _sync_and_read(
         db_path_str=db_path_str, trades=trades, cash_tx=cash_tx,
-        equity=equity, nav=nav, window=window,
+        equity=equity, symbols=symbols, nav=nav, window=window,
     )
 
     return {
@@ -119,6 +124,7 @@ def load_portfolio(token: str, query_id: str, db_path_str: str, session: str) ->
         "trades": trades,
         "cash": parser.cash_df(stmt),
         "equity": equity,
+        "symbols": symbols,
         "cash_tx": cash_tx,
         "accruals": parser.dividend_accruals_df(stmt),
         "nav": nav,
@@ -132,6 +138,7 @@ def _sync_and_read(
     trades: pd.DataFrame,
     cash_tx: pd.DataFrame,
     equity: pd.DataFrame,
+    symbols: pd.DataFrame,
     nav: dict,
     window: dict,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
@@ -144,8 +151,8 @@ def _sync_and_read(
     empty = {"tables": {}, "window": window, "written": 0, "error": None}
     try:
         report = sync.plan(
-            db_path=db_path_str, trades=trades, cash_tx=cash_tx, equity=equity, nav=nav,
-            window=window, today=now.date().isoformat(),
+            db_path=db_path_str, trades=trades, cash_tx=cash_tx, equity=equity,
+            symbols=symbols, nav=nav, window=window, today=now.date().isoformat(),
             now=now.isoformat(timespec="seconds"),
         )
     except Exception as exc:  # noqa: BLE001 — the check is best-effort by design
@@ -155,7 +162,8 @@ def _sync_and_read(
     if sync.pending(report=report):
         # The store holds history IBKR can no longer re-serve, so back it up
         # before writing. backup.run swallows its own failures.
-        backup.run(db_path_str, settings.backup_dir, keep=settings.backup_keep)
+        backup.run(db_path_str, settings.backup_dir, keep=settings.backup_keep,
+                   today=_backup_day())
         try:
             report["written"] = sync.apply(
                 db_path=db_path_str, report=report, today=now.date().isoformat(),
@@ -182,6 +190,11 @@ def _sync_and_read(
 @st.cache_data(show_spinner=False)
 def load_prices(symbol: str, period: str) -> pd.DataFrame:
     return prices.fetch_ohlc(symbol, period=period)
+
+
+@st.cache_data(show_spinner=False)
+def load_expense_ratio(symbol: str) -> float | None:
+    return prices.fetch_expense_ratio(symbol=symbol)
 
 
 @st.cache_data(show_spinner="Fetching upcoming dividends (yfinance)…")
@@ -227,6 +240,9 @@ def render_sidebar() -> DeltaGenerator:
         # for keyed widgets not rendered in a run — so Refresh would silently
         # reset the user's selections to defaults (e4 FE-1 regression).
         st.cache_data.clear()
+        # The one click (besides a newly saved token) that asks IBKR again after a failure.
+        if _FLEX_FAILED in st.session_state:
+            del st.session_state[_FLEX_FAILED]
     db_state = "ready" if settings.db_path.exists() else "empty (created on first refresh)"
     st.sidebar.caption(f"Database: {db_state}", help=str(settings.db_path))
 
@@ -251,7 +267,8 @@ def _fmt_money(v, ccy: str | None) -> str:
     return f"{v:,.2f} {ccy or ''}".strip()
 
 
-def tab_overview(data: dict) -> None:
+def tab_overview(data: dict, *, watch_state: dict) -> None:
+    _render_watchlist_alerts(state=watch_state)
     account, nav = data["account"], data["nav"]
     st.subheader("Account")
     cols = st.columns(2)
@@ -442,71 +459,235 @@ def _fmt_delta(value, pct) -> str | None:
     return None
 
 
+_PX_SYMBOL_KEY = "px_symbol"
+
+
+def _closes_since_first_trade(
+    *, symbol: str, trades: pd.DataFrame, frames: list[pd.DataFrame],
+) -> pd.DataFrame | None:
+    """Daily closes reaching back to my first trade of ``symbol``.
+
+    Reuses one of the already-loaded ``frames`` when it goes back far enough, so
+    the full-history pull happens only for a holding older than the chart.
+    """
+    first = price_stats.first_trade_date(trades=trades, symbol=symbol)
+    if first is None:
+        return None
+    for frame in frames:
+        if not frame.empty and "date" in frame:
+            if pd.to_datetime(frame["date"]).min().date() <= first:
+                return frame
+    return load_prices(symbol, "max")
+
+
+def _step_price_symbol(symbols: list[str], step: int) -> None:
+    """Move the Prices tab's symbol ``step`` places along ``symbols``, stopping at the ends."""
+    index = symbols.index(st.session_state[_PX_SYMBOL_KEY]) + step
+    st.session_state[_PX_SYMBOL_KEY] = symbols[max(0, min(index, len(symbols) - 1))]
+
+
 def tab_prices(data: dict) -> None:
     positions = data["positions"]
     symbols = sorted(positions["symbol"].dropna().unique()) if not positions.empty else []
     if not symbols:
         st.info("No symbols available (no open positions). Prices use yfinance.")
         return
-    c1, c2 = st.columns([2, 1])
-    symbol = c1.selectbox("Symbol", symbols)
-    period = c2.selectbox("Period", ["1mo", "3mo", "6mo", "1y", "2y", "5y"], index=3)
+    # A symbol kept from an earlier run can be gone after a refresh (position closed).
+    if _PX_SYMBOL_KEY not in st.session_state or st.session_state[_PX_SYMBOL_KEY] not in symbols:
+        st.session_state[_PX_SYMBOL_KEY] = symbols[0]
+    c1, up, down, c2 = st.columns([10, 0.6, 0.6, 5], vertical_alignment="bottom")
+    symbol = c1.selectbox("Symbol", symbols, key=_PX_SYMBOL_KEY)
+    if len(symbols) > 1:
+        up.button(
+            "▲", key="px_symbol_prev", help="Previous symbol", disabled=symbol == symbols[0],
+            on_click=_step_price_symbol, kwargs={"symbols": symbols, "step": -1}, width="stretch",
+        )
+        down.button(
+            "▼", key="px_symbol_next", help="Next symbol", disabled=symbol == symbols[-1],
+            on_click=_step_price_symbol, kwargs={"symbols": symbols, "step": 1}, width="stretch",
+        )
+    period = c2.selectbox("Period", _PRICE_PERIODS, index=3)
+    _render_price_detail(
+        symbol=symbol, period=period, positions=positions, cash_tx=data["cash_tx"],
+        trades=data["trades"], key_prefix="px", layout="prices", quote=None,
+        buy_target=None, sell_target=None, show_position=True,
+    )
 
+
+_PRICE_PERIODS = ["1mo", "3mo", "6mo", "1y", "2y", "5y"]
+
+# Tile rows of the price detail, per layout. The Watchlist puts the targets
+# first and drops the position tiles for a stock that is not held.
+_DETAIL_ROWS = {
+    ("prices", True): [
+        ["current", "avg_cost", "unrealized", "position"],
+        ["mean", "high_low", "range_52w", "period_return"],
+        ["volume", "volatility", "atr", "total_return"],
+        ["div_net", "div_gross", "last_div", "yield", "expense"],
+    ],
+    ("watchlist", True): [
+        ["current", "buy_target", "sell_target", "position"],
+        ["avg_cost", "unrealized", "total_return", "period_return"],
+        ["mean", "high_low", "range_52w", "volume"],
+        ["volatility", "atr", "expense", "yield"],
+        ["div_net", "div_gross", "last_div"],
+    ],
+    ("watchlist", False): [
+        ["current", "buy_target", "sell_target", "period_return"],
+        ["mean", "high_low", "range_52w", "volume"],
+        ["volatility", "atr", "expense"],
+    ],
+}
+
+
+def _fmt_price(v) -> str:
+    """A price or target: 2 decimals from 1 up, 4 significant digits below (FX, small coins)."""
+    if v is None or pd.isna(v):
+        return "—"
+    return f"{v:,.2f}" if abs(v) >= 1 else f"{v:.4g}"
+
+
+def _target_caption(*, price: float | None, target: float | None, side: str) -> str | None:
+    left = watchlist.distance_left(price=price, target=target, side=side)
+    if left is None:
+        return None
+    if left == 0:
+        return "reached"
+    return f"price {left:.2f}% {'above' if side == 'buy' else 'below'} target"
+
+
+def _render_price_detail(
+    *, symbol: str, period: str, positions: pd.DataFrame, cash_tx: pd.DataFrame,
+    trades: pd.DataFrame, key_prefix: str, layout: str, quote: dict | None,
+    buy_target: float | None, sell_target: float | None, show_position: bool,
+) -> None:
+    """KPI tiles, overlay toggles and candlestick chart for one symbol.
+
+    Shared by the Prices tab (``layout="prices"``, last close) and the Watchlist
+    tab (``layout="watchlist"``, delayed intraday ``quote`` and targets). Both
+    render in the same run, so every widget and the chart are keyed by
+    ``key_prefix``.
+    """
+    watch = layout == "watchlist"
     ohlc = load_prices(symbol, period)
     # The 52-week range must not move when the period selector narrows, so it is
     # computed off a separate 1y pull (cached, and free when period is already 1y).
     year_ohlc = ohlc if period == "1y" else load_prices(symbol, "1y")
     stats = price_stats.summarize(
-        ohlc, symbol, positions=positions, cash_tx=data["cash_tx"], year_ohlc=year_ohlc,
+        ohlc, symbol, positions=positions, cash_tx=cash_tx, year_ohlc=year_ohlc,
+        live_price=quote["price"] if quote else None,
+        live_previous_close=quote["previous_close"] if quote else None,
     )
-    ccy = stats.get("currency")
+    ccy = stats.get("currency") or (quote["currency"] if quote else None)
     div = stats["dividends"]
+    price = quote["price"] if quote else None
 
-    # ---- KPI rows ---------------------------------------------------------
-    r1 = st.columns(4)
-    r1[0].metric("Current price", _fmt_money(stats["current"], ccy),
-                 _fmt_delta(stats["day_change"], stats["day_change_pct"]))
-    r1[1].metric("My avg cost", _fmt_money(stats["avg_cost"], ccy),
-                 f"basis {_fmt_money(stats['cost_basis'], ccy)}"
-                 if stats["cost_basis"] is not None else None, delta_color="off")
-    r1[2].metric("Unrealized P&L", _fmt_money(stats["unrealized_live"], ccy),
-                 _fmt_delta(None, stats["vs_cost_pct"]))
-    r1[3].metric("Position", _fmt_qty(stats["quantity"]),
-                 f"{_fmt_money(stats['market_value_live'], ccy)} mkt value"
-                 if stats["market_value_live"] is not None else None,
-                 delta_color="off")
+    expense_ratio = load_expense_ratio(symbol)
+    expense_cost = price_stats.expense_cost_per_year(
+        expense_ratio_pct=expense_ratio, market_value=stats["market_value_live"],
+    )
+    expense_paid = price_stats.expense_paid(
+        closes=_closes_since_first_trade(
+            symbol=symbol, trades=trades, frames=[ohlc, year_ohlc],
+        ) if expense_ratio is not None and show_position else None,
+        trades=trades, symbol=symbol, quantity=stats["quantity"],
+        expense_ratio_pct=expense_ratio, today=dt.date.today(),
+    )
 
-    r2 = st.columns(4)
-    r2[0].metric(f"Period mean ({period})", _fmt_money(stats["period_mean"], ccy))
-    r2[1].metric(f"Period high / low ({period})",
-                 f"{_fmt_num(stats['period_high'])} / {_fmt_num(stats['period_low'])}",
-                 _fmt_delta(None, stats["off_period_high_pct"]))
-    r2[2].metric("52-week high / low",
-                 f"{_fmt_num(stats['high_52w'])} / {_fmt_num(stats['low_52w'])}")
-    r2[3].metric(f"Period return ({period})", _fmt_num(stats["period_return_pct"], "%"))
+    def current(col: DeltaGenerator) -> None:
+        if watch:
+            # No quote: the last close is not the "current" price on this tab.
+            col.metric("Current price (delayed)",
+                       _fmt_money(price, ccy) if price is not None else "—",
+                       _fmt_delta(stats["day_change"], stats["day_change_pct"])
+                       if price is not None else None)
+        else:
+            col.metric("Current price", _fmt_money(stats["current"], ccy),
+                       _fmt_delta(stats["day_change"], stats["day_change_pct"]))
 
-    r3 = st.columns(4)
-    r3[0].metric("Avg volume", _fmt_num(stats["avg_volume"], digits=0))
-    r3[1].metric("Volatility (ann.)", _fmt_num(stats["volatility_pct"], "%"))
-    r3[2].metric("ATR(14)", _fmt_money(stats["atr"], ccy))
-    r3[3].metric("Total return incl. divs", _fmt_money(stats["total_return"], ccy),
-                 _fmt_delta(None, stats["total_return_pct"]))
+    def target(col: DeltaGenerator, label: str, value: float | None, side: str) -> None:
+        col.metric(label, _fmt_price(value),
+                   _target_caption(price=price, target=value, side=side),
+                   delta_color="off", delta_arrow="off")
 
-    r4 = st.columns(4)
-    r4[0].metric("Dividends received (net)", _fmt_money(div["net"], ccy),
-                 f"{div['count']} payments" if div["count"] else None, delta_color="off")
-    r4[1].metric("Dividends received (gross)", _fmt_money(div["gross"], ccy))
-    r4[2].metric("Last dividend", _fmt_money(div["last_amount"], ccy),
-                 str(div["last_date"]) if div["last_date"] else None, delta_color="off")
-    r4[3].metric("Yield (TTM) / on cost",
-                 f"{_fmt_num(stats['yield_pct'], '%')} / {_fmt_num(stats['yield_on_cost_pct'], '%')}")
+    tiles = {
+        "current": current,
+        "buy_target": lambda col: target(col, "Buy target", buy_target, "buy"),
+        "sell_target": lambda col: target(col, "Sell target", sell_target, "sell"),
+        "avg_cost": lambda col: col.metric(
+            "My avg cost", _fmt_money(stats["avg_cost"], ccy),
+            f"basis {_fmt_money(stats['cost_basis'], ccy)}"
+            if stats["cost_basis"] is not None else None, delta_color="off"),
+        "unrealized": lambda col: col.metric(
+            "Unrealized P&L", _fmt_money(stats["unrealized_live"], ccy),
+            _fmt_delta(None, stats["vs_cost_pct"])),
+        "position": lambda col: col.metric(
+            "Position", _fmt_qty(stats["quantity"]),
+            f"{_fmt_money(stats['market_value_live'], ccy)} mkt value"
+            if stats["market_value_live"] is not None else None, delta_color="off"),
+        "mean": lambda col: col.metric(
+            f"Period mean ({period})", _fmt_money(stats["period_mean"], ccy)),
+        "high_low": lambda col: col.metric(
+            f"Period high / low ({period})",
+            f"{_fmt_num(stats['period_high'])} / {_fmt_num(stats['period_low'])}",
+            _fmt_delta(None, stats["off_period_high_pct"])),
+        "range_52w": lambda col: col.metric(
+            "52-week high / low",
+            f"{_fmt_num(stats['high_52w'])} / {_fmt_num(stats['low_52w'])}"),
+        "period_return": lambda col: col.metric(
+            f"Period return ({period})", _fmt_num(stats["period_return_pct"], "%")),
+        "volume": lambda col: col.metric("Avg volume", _fmt_num(stats["avg_volume"], digits=0)),
+        "volatility": lambda col: col.metric(
+            "Volatility (ann.)", _fmt_num(stats["volatility_pct"], "%")),
+        "atr": lambda col: col.metric("ATR(14)", _fmt_money(stats["atr"], ccy)),
+        "total_return": lambda col: col.metric(
+            "Total return incl. divs", _fmt_money(stats["total_return"], ccy),
+            _fmt_delta(None, stats["total_return_pct"])),
+        "div_net": lambda col: col.metric(
+            "Dividends received (net)", _fmt_money(div["net"], ccy),
+            f"{div['count']} payments" if div["count"] else None, delta_color="off"),
+        "div_gross": lambda col: col.metric(
+            "Dividends received (gross)", _fmt_money(div["gross"], ccy)),
+        "last_div": lambda col: col.metric(
+            "Last dividend", _fmt_money(div["last_amount"], ccy),
+            str(div["last_date"]) if div["last_date"] else None, delta_color="off"),
+        "yield": lambda col: col.metric(
+            "Yield (TTM) / on cost",
+            f"{_fmt_num(stats['yield_pct'], '%')} / {_fmt_num(stats['yield_on_cost_pct'], '%')}"),
+        "expense": lambda col: col.metric(
+            "Expense Ratio", _fmt_num(expense_ratio, "%"),
+            f"≈ {_fmt_money(expense_paid['amount'], ccy)} paid since {expense_paid['since']}"
+            if expense_paid["amount"] is not None else None,
+            delta_color="off", delta_arrow="off",
+            help="Yearly fee the fund takes from its own assets (yfinance net expense "
+                 "ratio). It is already inside the price and is never charged to the "
+                 "account, so the paid amount is an estimate: for each day held, "
+                 "shares × close × ratio ÷ 365, at today's ratio. "
+                 + (f"At today's value it is about {_fmt_money(expense_cost, ccy)} a year. "
+                    if expense_cost is not None else "")
+                 + "ETFs and funds only; a stock has none."),
+    }
+    for names in _DETAIL_ROWS[(layout, show_position)]:
+        for col, name in zip(st.columns(max(4, len(names))), names):
+            tiles[name](col)
 
     # ---- overlay toggles --------------------------------------------------
-    t1, t2, t3, t4 = st.columns(4)
-    show_cost = t1.checkbox("Avg cost line", value=True, key="px_cost")
-    show_ma = t2.checkbox("MA 20/50", value=True, key="px_ma")
-    show_mean = t3.checkbox("Period mean", value=False, key="px_mean")
-    show_trades = t4.checkbox("Buy/Sell markers", value=True, key="px_trades")
+    has_targets = buy_target is not None or sell_target is not None
+    if watch:
+        t0, t1, t2, t3, t4 = st.columns(5)
+        # Disabled, not hidden: a keyed widget that is not rendered loses its state.
+        show_targets = t0.checkbox("Target lines", value=True, key=f"{key_prefix}_targets",
+                                   disabled=not has_targets) and has_targets
+    else:
+        t1, t2, t3, t4 = st.columns(4)
+        show_targets = False
+    show_cost = t1.checkbox("Avg cost line", value=True, key=f"{key_prefix}_cost",
+                            disabled=not show_position) and show_position
+    show_ma = t2.checkbox("MA 20/50", value=True, key=f"{key_prefix}_ma")
+    show_mean = t3.checkbox("Period mean", value=False, key=f"{key_prefix}_mean")
+    show_trades = t4.checkbox("My trades" if watch else "Buy/Sell markers", value=True,
+                              key=f"{key_prefix}_trades",
+                              disabled=not show_position) and show_position
 
     st.plotly_chart(
         figures.candlestick(
@@ -514,18 +695,787 @@ def tab_prices(data: dict) -> None:
             avg_cost=stats["avg_cost"] if show_cost else None,
             ma_windows=(20, 50) if show_ma else (),
             mean_close=stats["period_mean"] if show_mean else None,
-            trades=(data["trades"][data["trades"]["symbol"].astype(str) == str(symbol)]
-                    if show_trades and not data["trades"].empty else None),
+            trades=(trades[trades["symbol"].astype(str) == str(symbol)]
+                    if show_trades and not trades.empty else None),
+            buy_target=buy_target if show_targets else None,
+            sell_target=sell_target if show_targets else None,
         ),
-        width="stretch",
+        width="stretch", key=f"{key_prefix}_chart",
     )
+    if watch:
+        st.caption(
+            '"Current price (delayed)" on this tab is the yfinance quote, which may be '
+            "delayed (about 15 minutes on most exchanges), so P&L here can differ from the "
+            "Prices tab, which uses the last close. The chart is daily candles."
+        )
+        return
     as_of = f" ({stats['as_of']})" if stats["as_of"] else ""
     st.caption(
         "Price, ranges and volatility: yfinance (Flex provides no market data); "
         f"current price is the last close{as_of}. "
         "Cost, position and dividends come from the Flex statement — dividend totals "
         "cover the statement's date range only. Yield (TTM) = trailing-12-month "
-        "dividends ÷ current price; on cost uses my average cost."
+        "dividends ÷ current price; on cost uses my average cost. "
+        "Expense ratio: yfinance; the paid amount is an estimate from my trades and "
+        "daily closes — no statement carries it."
+    )
+
+
+# ---- watchlist --------------------------------------------------------------
+
+_WL_LIST = "wl_list"
+_WL_SYMBOL = "wl_symbol"
+_WL_DIALOG = "wl_dialog"
+_QUOTE_WORKERS = 6
+
+_WL_READ_ERROR = "The watchlist could not be read from the database."
+_WL_SETUP_ERROR = "The watchlist could not be set up in the database."
+_ALERT_COLORS = {watchlist.ALERT_TEXT["buy"]: "background-color: rgba(26, 127, 55, 0.25)",
+                 watchlist.ALERT_TEXT["sell"]: "background-color: rgba(178, 24, 43, 0.25)"}
+_SCHEDULE_MODES = {watchlist.SCHEDULE_ONCE: "Only when I open the app",
+                   watchlist.SCHEDULE_EVERY: "Every N minutes"}
+_SCHEDULE_DURATIONS = {watchlist.DURATION_HOURS: "For the hours below",
+                       watchlist.DURATION_ALWAYS: "No end time"}
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def load_quotes(symbols: tuple[str, ...], bucket: str) -> dict:
+    """Delayed intraday quotes for every watched symbol.
+
+    ``bucket`` is only a cache key (see ``watchlist.quote_bucket``): one fetch per
+    browser session, or one per schedule window.
+    """
+    return {"quotes": prices.fetch_quotes(symbols=symbols, workers=_QUOTE_WORKERS),
+            "fetched": watchlist.utc_now()}
+
+
+def _backup_day() -> str:
+    """Today's local date, from the watchlist clock, as the backup file's day."""
+    return watchlist.utc_now().astimezone(watchlist.local_tz()).date().isoformat()
+
+
+def _watchlist_state() -> dict:
+    """Lists, stocks, schedule and quotes for this run. Built once, in main()."""
+    now = watchlist.utc_now()
+    if "wl_nonce" not in st.session_state:
+        st.session_state["wl_nonce"] = 0
+    state = {"now": now, "error": None, "quotes": {}, "fetched": None}
+    try:
+        watchlist.init_db(db_path=settings.db_path)
+    except Exception:  # noqa: BLE001 — a broken watchlist must not cost the other tabs
+        logger.exception("watchlist init failed")
+        state["error"] = _WL_SETUP_ERROR
+    lists = watchlist.read_lists(db_path=settings.db_path)
+    items = watchlist.read_items(db_path=settings.db_path)
+    if state["error"] is None and (lists["error"] or items["error"]):
+        state["error"] = _WL_READ_ERROR
+    state["lists"], state["items"] = lists["lists"], items["items"]
+    state["setting"] = watchlist.read_refresh(db_path=settings.db_path)
+    state["bucket"] = watchlist.quote_bucket(
+        setting=state["setting"], now=now, session=session_key(),
+        nonce=st.session_state["wl_nonce"],
+    )
+    symbols = tuple(sorted(state["items"]["symbol"]))
+    if symbols and state["error"] is None:
+        if "wl_fetched_once" in st.session_state:
+            loaded = load_quotes(symbols=symbols, bucket=state["bucket"])
+        else:
+            with st.spinner("Fetching watchlist prices…"):
+                loaded = load_quotes(symbols=symbols, bucket=state["bucket"])
+            st.session_state["wl_fetched_once"] = True
+        state["quotes"], state["fetched"] = loaded["quotes"], loaded["fetched"]
+    return state
+
+
+def _watchlist_tick() -> None:
+    """Timer fragment: redraw the whole page once per schedule window.
+
+    Its body also runs inside every full run; there it only arms itself, because
+    a rerun requested during a full run would reset widgets not yet rendered.
+    """
+    if not st.session_state["wl_tick_armed"]:
+        st.session_state["wl_tick_armed"] = True
+        return
+    if watchlist.tick_should_rerun(
+        setting=watchlist.read_refresh(db_path=settings.db_path), now=watchlist.utc_now(),
+        session=session_key(), nonce=st.session_state["wl_nonce"],
+        bucket_seen=st.session_state["wl_bucket_seen"],
+        dialog_open=watchlist.dialog_open(keys={str(key) for key in st.session_state}),
+    ):
+        st.rerun()
+
+
+def _fetched_text(*, state: dict) -> str:
+    return watchlist.fetched_label(fetched=state["fetched"], now=state["now"], tz=watchlist.local_tz())
+
+
+def _render_watchlist_alerts(*, state: dict) -> None:
+    """The box at the top of Overview: every stock at its buy or sell target."""
+    # The slot always exists, so the box coming and going cannot shift the tabs' identity.
+    slot = st.container()
+    if state["error"] is not None:
+        with slot.container(border=True):
+            st.markdown("**Watchlist prices**")
+            st.write("Watchlist could not be read. Targets were not checked.")
+        return
+    items = state["items"]
+    if items.empty:
+        return
+    found = watchlist.alerts(items=items, quotes=state["quotes"])
+    if found["all_failed"]:
+        with slot.container(border=True):
+            st.markdown("**Watchlist prices**")
+            st.write("Watchlist prices could not be fetched. Targets were not checked. "
+                     "Open the Watchlist tab and click Update now.")
+        return
+    if not found["lines"] and not found["missing"]:
+        return
+    with slot.container(border=True):
+        count = len(found["lines"])
+        st.markdown(f"**Watchlist alerts ({count})**" if count else "**Watchlist prices**")
+        for line in found["lines"]:
+            buy = line["side"] == "buy"
+            badge = ":green-badge[BUY]" if buy else ":red-badge[SELL]"
+            st.markdown(
+                f"{badge} **{line['symbol']}** {_fmt_money(line['price'], line['currency'])} is at or "
+                f"{'below' if buy else 'above'} your {'buy' if buy else 'sell'} target "
+                f"{_fmt_price(line['target'])} · {line['list_name']}"
+            )
+        if found["missing"]:
+            many = len(found["missing"]) > 1
+            st.write(f"No price for: {', '.join(found['missing'])}. "
+                     + ("Their targets were not checked." if many else "Its target was not checked."))
+        if state["fetched"] is not None:
+            st.caption(f"Fetched {_fetched_text(state=state)}. Quotes may be delayed (about 15 "
+                       "minutes on most exchanges). See the Watchlist tab.")
+
+
+# -- dialogs: one at a time, opened by a flag and closed by callbacks ---------
+
+def _open_watchlist_dialog(*, kind: str, payload: dict) -> None:
+    """Button callback: remember which dialog is open and give its fields their
+    start values (a keyed field shows its key's value, not ``value=``)."""
+    _close_watchlist_dialog()
+    st.session_state[_WL_DIALOG] = {"kind": kind, **payload}
+    for key, value in watchlist.dialog_state(kind=kind, payload=payload).items():
+        st.session_state[key] = value
+
+
+def _close_watchlist_dialog() -> None:
+    for key in (_WL_DIALOG, "wl_dlg_error", "wl_dlg_note", "wl_dlg_remove_armed"):
+        if key in st.session_state:
+            del st.session_state[key]
+
+
+def _save_watchlist(*, action) -> str | None:
+    """Run one watchlist write. Returns the text to show when it was refused,
+    else None after refreshing today's backup (the data exists nowhere else)."""
+    try:
+        action()
+    except watchlist.WatchlistError as exc:
+        return str(exc)
+    backup.refresh(db_path=settings.db_path, backup_dir=settings.backup_dir,
+                   keep=settings.backup_keep, today=_backup_day())
+    return None
+
+
+def _dialog_failed(*, error: str | None) -> bool:
+    if error is None:
+        return False
+    st.session_state["wl_dlg_error"] = error
+    return True
+
+
+def _save_new_list() -> None:
+    made: dict = {}
+    name = st.session_state["wl_dlg_name"]
+    if _dialog_failed(error=_save_watchlist(action=lambda: made.update(id=watchlist.create_list(
+            db_path=settings.db_path, name=name, now=watchlist.utc_now())))):
+        return
+    st.session_state[_WL_LIST] = made["id"]
+    _close_watchlist_dialog()
+
+
+def _save_rename_list() -> None:
+    payload, name = st.session_state[_WL_DIALOG], st.session_state["wl_dlg_name"]
+    if _dialog_failed(error=_save_watchlist(action=lambda: watchlist.rename_list(
+            db_path=settings.db_path, list_id=payload["list_id"], name=name))):
+        return
+    _close_watchlist_dialog()
+
+
+def _save_delete_list() -> None:
+    payload = st.session_state[_WL_DIALOG]
+    if _dialog_failed(error=_save_watchlist(action=lambda: watchlist.delete_list(
+            db_path=settings.db_path, list_id=payload["list_id"]))):
+        return
+    _close_watchlist_dialog()
+
+
+def _target_notice(*, symbol: str, price: float | None, buy_target: float | None,
+                   sell_target: float | None) -> str | None:
+    """The one-time line for a target that is already reached when it is saved."""
+    if price is None:
+        return None
+    if buy_target is not None and price <= buy_target:
+        return f"{symbol}: the price is already at or below your buy target."
+    if sell_target is not None and price >= sell_target:
+        return f"{symbol}: the price is already at or above your sell target."
+    return None
+
+
+def _save_add_stock(*, another: bool) -> None:
+    payload = st.session_state[_WL_DIALOG]
+    buy, sell = st.session_state["wl_dlg_buy"], st.session_state["wl_dlg_sell"]
+    for key in ("wl_dlg_error", "wl_dlg_note"):
+        if key in st.session_state:
+            del st.session_state[key]
+    try:
+        typed = watchlist.clean_symbol(text=st.session_state["wl_dlg_ticker"])
+        watchlist.validate_targets(buy_target=buy, sell_target=sell)
+    except watchlist.WatchlistError as exc:
+        _dialog_failed(error=str(exc))
+        return
+    # Before yfinance: "7203-T" against a watched "7203.T" is a duplicate, not unknown.
+    watched = watchlist.read_items(db_path=settings.db_path)["items"]
+    if _dialog_failed(error=watchlist.duplicate_text(
+            items=watched, symbol=typed, list_id=payload["list_id"])):
+        return
+    found = prices.resolve_symbol(text=typed)
+    if found["status"] == "unknown":
+        _dialog_failed(error=f'"{typed}" was not found on yfinance. Check the ticker.')
+        return
+    if found["status"] != "ok":
+        _dialog_failed(error=f'Could not check "{typed}" (yfinance did not answer). Try again.')
+        return
+    symbol = found["symbol"]
+    if _dialog_failed(error=_save_watchlist(action=lambda: watchlist.add_item(
+            db_path=settings.db_path, list_id=payload["list_id"], symbol=symbol,
+            buy_target=buy, sell_target=sell, now=watchlist.utc_now()))):
+        return
+    quote = prices.fetch_quote(symbol=symbol)
+    notice = _target_notice(symbol=symbol, price=quote["price"] if quote else None,
+                            buy_target=buy, sell_target=sell)
+    if notice:
+        st.session_state["wl_notice"] = notice
+    st.session_state[_WL_SYMBOL] = symbol
+    if not another:
+        _close_watchlist_dialog()
+        return
+    st.session_state["wl_dlg_note"] = (
+        f"Added {symbol} at {_fmt_money(quote['price'], quote['currency'])}." if quote
+        else f"Added {symbol} (no price yet)."
+    )
+    for key, value in watchlist.dialog_state(kind="add_stock", payload=payload).items():
+        st.session_state[key] = value
+
+
+def _save_edit_stock() -> None:
+    payload = st.session_state[_WL_DIALOG]
+    symbol, list_id = payload["symbol"], st.session_state["wl_dlg_list"]
+    buy, sell = st.session_state["wl_dlg_buy"], st.session_state["wl_dlg_sell"]
+    if list_id is None:
+        _dialog_failed(error=watchlist.MSG_PICK_LIST)
+        return
+    if _dialog_failed(error=_save_watchlist(action=lambda: watchlist.update_item(
+            db_path=settings.db_path, symbol=symbol, list_id=list_id,
+            buy_target=buy, sell_target=sell))):
+        return
+    moved = list_id != payload["list_id"]
+    old_buy, old_sell = payload["buy_target"], payload["sell_target"]
+    retargeted = (buy, sell) != (old_buy, old_sell)
+    names = dict(payload["lists"])
+    if moved and retargeted:
+        st.session_state["wl_toast"] = f"Moved {symbol} to {names[list_id]} and saved its targets."
+    elif moved:
+        st.session_state["wl_toast"] = f"Moved {symbol} to {names[list_id]}."
+    elif retargeted:
+        st.session_state["wl_toast"] = f"Saved targets for {symbol}."
+    notice = _target_notice(
+        symbol=symbol, price=payload["price"],
+        buy_target=buy if buy != old_buy else None,
+        sell_target=sell if sell != old_sell else None,
+    )
+    if notice:
+        st.session_state["wl_notice"] = notice
+    _close_watchlist_dialog()
+
+
+def _arm_remove_stock() -> None:
+    st.session_state["wl_dlg_remove_armed"] = True
+
+
+def _confirm_remove_stock() -> None:
+    payload = st.session_state[_WL_DIALOG]
+    if _dialog_failed(error=_save_watchlist(action=lambda: watchlist.remove_item(
+            db_path=settings.db_path, symbol=payload["symbol"]))):
+        return
+    _close_watchlist_dialog()
+
+
+def _save_schedule() -> None:
+    now = watchlist.utc_now()
+    if st.session_state["wl_dlg_mode"] == watchlist.SCHEDULE_ONCE:
+        minutes, until = None, None
+    else:
+        minutes = int(st.session_state["wl_dlg_minutes"])
+        until = (None if st.session_state["wl_dlg_duration"] == watchlist.DURATION_ALWAYS
+                 else now + dt.timedelta(hours=int(st.session_state["wl_dlg_hours"])))
+    if _dialog_failed(error=_save_watchlist(action=lambda: watchlist.write_refresh(
+            db_path=settings.db_path, interval_minutes=minutes, until=until))):
+        return
+    _close_watchlist_dialog()
+
+
+def _dialog_guard() -> None:
+    """First statement of every dialog body: a callback that closed the dialog
+    ran inside the dialog's own fragment, so the page has to be redrawn."""
+    if _WL_DIALOG not in st.session_state:
+        st.rerun()
+
+
+def _dialog_messages() -> None:
+    if "wl_dlg_note" in st.session_state:
+        st.caption(st.session_state["wl_dlg_note"])
+    if "wl_dlg_error" in st.session_state:
+        st.warning(st.session_state["wl_dlg_error"])
+
+
+def _dialog_buttons(*, label: str, on_save, save_kwargs: dict) -> None:
+    cancel, save = st.columns(2)
+    cancel.button("Cancel", key="wl_dlg_cancel", on_click=_close_watchlist_dialog, width="stretch")
+    save.button(label, key="wl_dlg_save", type="primary", on_click=on_save,
+                kwargs=save_kwargs, width="stretch")
+
+
+def _name_dialog_body(*, payload: dict) -> None:
+    _dialog_guard()
+    st.text_input("List name", key="wl_dlg_name")
+    _dialog_messages()
+    if payload["kind"] == "new_list":
+        _dialog_buttons(label="Create", on_save=_save_new_list, save_kwargs={})
+    else:
+        _dialog_buttons(label="Save", on_save=_save_rename_list, save_kwargs={})
+
+
+def _delete_list_dialog_body(*, payload: dict) -> None:
+    _dialog_guard()
+    symbols = payload["symbols"]
+    if symbols:
+        shown = ", ".join(symbols[:10]) + (f" and {len(symbols) - 10} more" if len(symbols) > 10 else "")
+        noun = "stock" if len(symbols) == 1 else "stocks"
+        st.write(f'Delete list "{payload["name"]}"? It holds {len(symbols)} {noun}: {shown}. '
+                 "Their buy and sell targets are deleted too. This cannot be undone.")
+    else:
+        st.write(f'Delete list "{payload["name"]}"? It is empty.')
+    _dialog_messages()
+    _dialog_buttons(label="Delete list", on_save=_save_delete_list, save_kwargs={})
+
+
+def _target_field(*, label: str, key: str, price: float | None, help_text: str | None) -> None:
+    small = price is not None and price < 1
+    # value=None only makes an empty field possible; the key decides what is shown.
+    st.number_input(label, key=key, value=None, placeholder="Leave empty for no target",
+                    format="%.4f" if small else "%.2f", step=0.0001 if small else 0.01,
+                    help=help_text)
+
+
+def _add_stock_dialog_body(*, payload: dict) -> None:
+    _dialog_guard()
+    st.text_input("Ticker", key="wl_dlg_ticker")
+    currency_help = "In the quote's currency. London stocks quote in pence."
+    _target_field(label="Buy target", key="wl_dlg_buy", price=None, help_text=currency_help)
+    _target_field(label="Sell target", key="wl_dlg_sell", price=None, help_text=currency_help)
+    _dialog_messages()
+    cancel, another, add = st.columns(3)
+    cancel.button("Cancel", key="wl_dlg_cancel", on_click=_close_watchlist_dialog, width="stretch")
+    another.button("Add and add another", key="wl_dlg_add_another", on_click=_save_add_stock,
+                   kwargs={"another": True}, width="stretch")
+    add.button("Add", key="wl_dlg_save", type="primary", on_click=_save_add_stock,
+               kwargs={"another": False}, width="stretch")
+
+
+def _edit_stock_dialog_body(*, payload: dict) -> None:
+    _dialog_guard()
+    symbol, price, ccy = payload["symbol"], payload["price"], payload["currency"]
+    st.markdown(f"**{symbol}** · {_fmt_money(price, ccy)} now" if price is not None
+                else f"**{symbol}** · no price")
+    names = dict(payload["lists"])
+    st.selectbox("List", list(names), format_func=lambda list_id: names[list_id],
+                 key="wl_dlg_list", index=None, placeholder="Pick a list")
+    unit = f" ({ccy})" if ccy else ""
+    _target_field(label=f"Buy target{unit}", key="wl_dlg_buy", price=price, help_text=None)
+    _target_field(label=f"Sell target{unit}", key="wl_dlg_sell", price=price, help_text=None)
+    _dialog_messages()
+    _dialog_buttons(label="Save", on_save=_save_edit_stock, save_kwargs={})
+    st.divider()
+    if "wl_dlg_remove_armed" not in st.session_state:
+        st.button("Remove from watchlist", key="wl_dlg_remove", on_click=_arm_remove_stock)
+        return
+    # Another label and the other side, so a double click cannot remove.
+    st.warning(f'This deletes {symbol} and its targets from "{payload["list_name"]}".')
+    _, confirm = st.columns([1, 2])
+    confirm.button(f"Remove {symbol} and its targets", key="wl_dlg_remove_confirm",
+                   type="primary", on_click=_confirm_remove_stock, width="stretch")
+
+
+def _schedule_dialog_body(*, payload: dict) -> None:
+    _dialog_guard()
+    st.caption(f"Now: {payload['label']}.")
+    mode = st.radio("Update watchlist prices", list(_SCHEDULE_MODES), key="wl_dlg_mode",
+                    format_func=lambda value: _SCHEDULE_MODES[value])
+    every = mode == watchlist.SCHEDULE_EVERY
+    minutes = st.number_input("Minute(s)", min_value=1, max_value=60, step=1,
+                              key="wl_dlg_minutes", disabled=not every)
+    duration = st.radio("Duration", list(_SCHEDULE_DURATIONS), key="wl_dlg_duration",
+                        format_func=lambda value: _SCHEDULE_DURATIONS[value],
+                        horizontal=True, disabled=not every)
+    timed = every and duration == watchlist.DURATION_HOURS
+    hours = st.number_input("Hour(s)", min_value=1, max_value=24, step=1,
+                            key="wl_dlg_hours", disabled=not timed)
+    if timed:
+        st.caption(f"Save starts a new {int(hours)} hours from now.")
+    if every:
+        per_hour = watchlist.requests_per_hour(stocks=payload["watched"], interval_minutes=int(minutes))
+        st.caption(f"With {payload['watched']} watched stocks this is about {per_hour:,} "
+                   "yfinance requests an hour.")
+        st.caption("Works only while this page is open.")
+    _dialog_messages()
+    _dialog_buttons(label="Save", on_save=_save_schedule, save_kwargs={})
+
+
+def _dialog_title(*, payload: dict) -> str:
+    kind = payload["kind"]
+    if kind == "new_list":
+        return "New list"
+    if kind == "rename_list":
+        return f'Rename list "{payload["name"]}"'
+    if kind == "delete_list":
+        return f'Delete list "{payload["name"]}"'
+    if kind == "add_stock":
+        return f'Add stock to "{payload["list_name"]}"'
+    if kind == "edit_stock":
+        return f"Edit {payload['symbol']}"
+    return "Update schedule"
+
+
+_DIALOG_BODIES = {
+    "new_list": _name_dialog_body, "rename_list": _name_dialog_body,
+    "delete_list": _delete_list_dialog_body, "add_stock": _add_stock_dialog_body,
+    "edit_stock": _edit_stock_dialog_body, "schedule": _schedule_dialog_body,
+}
+
+
+def _watchlist_dialog() -> None:
+    """Open the dialog the flag names. Streamlit allows one dialog per run, so a
+    flag left beside another app dialog, or of an unknown kind, is dropped."""
+    if _WL_DIALOG not in st.session_state:
+        return
+    payload = st.session_state[_WL_DIALOG]
+    others = watchlist.DIALOG_FLAGS - {_WL_DIALOG}
+    if payload["kind"] not in _DIALOG_BODIES or others & {str(key) for key in st.session_state}:
+        _close_watchlist_dialog()
+        return
+    st.dialog(_dialog_title(payload=payload), on_dismiss=_close_watchlist_dialog)(
+        _DIALOG_BODIES[payload["kind"]]
+    )(payload=payload)
+
+
+def _pick_watchlist() -> None:
+    """The search box picked a list, or a stock (then its list opens on that stock)."""
+    kind, _, value = st.session_state[_WL_PICKER_KEY].partition(":")
+    if kind == "list":
+        st.session_state[_WL_LIST] = int(value)
+        return
+    symbol, _, list_id = value.partition("|")
+    st.session_state[_WL_LIST] = int(list_id)
+    st.session_state[_WL_SYMBOL] = symbol
+
+
+_WL_PICKER_KEY = "wl_list_select"
+# Height of one dropdown row, as Streamlit draws it.
+_WL_PICKER_ROW = "2.5rem"
+
+
+def _list_picker_css(*, lists: int, options: int) -> str:
+    """Stylesheet that keeps the tickers out of the list dropdown until the user types.
+
+    The dropdown holds the lists first, then every watched ticker, so that one
+    box searches both. Opened without typing it would show all of them; a
+    selectbox has no setting for that, so this hides the ticker rows while the
+    box's text is empty, and shortens the dropdown to the list rows.
+
+    It leans on how Streamlit builds the dropdown: the input mirrors the typed
+    text in its ``value`` attribute, and row ``n`` of what is shown has an id
+    ending in ``val-n``. Nothing is typed, so nothing is filtered, and row ``n``
+    is option ``n``. If a Streamlit upgrade changes either, the rules stop
+    matching and the tickers show again when the box opens; nothing else breaks.
+    """
+    if options <= lists:
+        return ""
+    idle = (f'body:has(.st-key-{_WL_PICKER_KEY} input[aria-expanded="true"][value=""]) '
+            '[data-testid="stSelectboxVirtualDropdown"]')
+    rows = ", ".join(f'{idle} li[id$="val-{index}"]' for index in range(lists, options))
+    height = f"calc({lists} * {_WL_PICKER_ROW})"
+    return (
+        "<style>"
+        f"{rows} {{ display: none; }} "
+        f"{idle} > div {{ max-height: {height}; }} "
+        f"{idle} > div > div {{ height: {height} !important; }}"
+        "</style>"
+    )
+
+
+def _step_watchlist(*, ids: list[int], step: int) -> None:
+    """Move to the list ``step`` places along ``ids`` (dropdown order), stopping at the ends."""
+    index = ids.index(st.session_state[_WL_LIST]) + step
+    st.session_state[_WL_LIST] = ids[max(0, min(index, len(ids) - 1))]
+
+
+def _step_watch_symbol(*, order: list[str], step: int) -> None:
+    """Move the watchlist's selected stock ``step`` rows, stopping at the ends.
+
+    With no stock selected, a step lands on the first row.
+    """
+    symbol = st.session_state[_WL_SYMBOL] if _WL_SYMBOL in st.session_state else None
+    index = order.index(symbol) + step if symbol in order else 0
+    st.session_state[_WL_SYMBOL] = order[max(0, min(index, len(order) - 1))]
+
+
+def _update_quotes_now() -> None:
+    st.session_state["wl_nonce"] += 1
+
+
+def _watchlist_styler(*, frame: pd.DataFrame):
+    """The list's table: numbers underneath (so sorting is numeric), text on top."""
+    shown = frame.rename(columns={
+        "symbol": "Symbol", "alert": "Alert", "price": "Price", "day_pct": "Day",
+        "buy_target": "Buy target", "above_buy": "Above buy", "sell_target": "Sell target",
+        "below_sell": "Below sell", "shares": "Shares held",
+    })
+    currencies = list(shown["currency"])
+    shown = shown.drop(columns="currency")
+
+    def left(value) -> str:
+        return "reached" if value == 0 else f"{value:.2f}%"
+
+    # na_rep, not the callables: Styler does not pass a missing value to them.
+    styler = shown.style.format({
+        "Day": lambda value: f"{value:+.2f}%",
+        "Buy target": _fmt_price, "Sell target": _fmt_price,
+        "Above buy": left, "Below sell": left, "Shares held": _fmt_qty,
+    }, na_rep="—")
+    # One format per row: the currency belongs to the row, not to the column.
+    for index, currency in zip(shown.index, currencies):
+        styler = styler.format(
+            lambda value, ccy=currency: _fmt_money(value, ccy), na_rep="no data",
+            subset=pd.IndexSlice[[index], ["Price"]],
+        )
+    return styler.map(lambda value: _ALERT_COLORS[value] if value in _ALERT_COLORS else "",
+                      subset=["Alert"])
+
+
+def _alert_count(*, count: int) -> str:
+    return f"{count} alert" if count == 1 else f"{count} alerts"
+
+
+def tab_watchlist(
+    *, state: dict, positions: pd.DataFrame, cash_tx: pd.DataFrame, trades: pd.DataFrame,
+    connected: bool,
+) -> None:
+    if not connected:
+        st.caption("IBKR not connected: positions not shown.")
+    if state["error"] is not None:
+        st.warning(state["error"])
+        _close_watchlist_dialog()
+        return
+    _watchlist_body(state=state, positions=positions, cash_tx=cash_tx, trades=trades)
+    _watchlist_dialog()
+
+
+def _watchlist_body(
+    *, state: dict, positions: pd.DataFrame, cash_tx: pd.DataFrame, trades: pd.DataFrame,
+) -> None:
+    lists, items, quotes = state["lists"], state["items"], state["quotes"]
+    if lists.empty:
+        st.info("You have no watchlists yet. Create one to start watching stocks.")
+        st.button("＋ New list", key="wl_new_list", on_click=_open_watchlist_dialog,
+                  kwargs={"kind": "new_list", "payload": {}})
+        return
+
+    ids = [int(list_id) for list_id in lists["id"]]
+    names = dict(zip(ids, lists["name"]))
+    found = watchlist.alerts(items=items, quotes=quotes)
+    if _WL_LIST not in st.session_state:
+        # A new session opens on the first alert, so it is seen without a search.
+        first = watchlist.first_alert(items=items, quotes=quotes)
+        st.session_state[_WL_LIST] = first["list_id"] if first else ids[0]
+        if first:
+            st.session_state[_WL_SYMBOL] = first["symbol"]
+    if st.session_state[_WL_LIST] not in ids:
+        st.session_state[_WL_LIST] = ids[0]
+    list_id = st.session_state[_WL_LIST]
+    list_name = names[list_id]
+
+    def label(option: int) -> str:
+        count = found["by_list"][option] if option in found["by_list"] else 0
+        return f"{names[option]} ({_alert_count(count=count)})" if count else names[option]
+
+    # One search box for lists and tickers: typing filters both, and a ticker opens
+    # its list on that stock. Options are keys, not labels, so a label that gains
+    # "(1 alert)" does not reset the pick; the box always shows the open list.
+    watched = [(row.symbol, int(row.list_id)) for row in items.itertuples(index=False)
+               if row.list_id in names]
+    options = [f"list:{option}" for option in ids] + [f"stock:{symbol}|{owner}" for symbol, owner in watched]
+
+    def option_label(option: str) -> str:
+        kind, _, value = option.partition(":")
+        if kind == "list":
+            return label(int(value))
+        symbol, _, owner = value.partition("|")
+        return f"{symbol} · in {names[int(owner)]}"
+
+    st.session_state[_WL_PICKER_KEY] = f"list:{list_id}"
+    picker_css = _list_picker_css(lists=len(ids), options=len(options))
+    if picker_css:
+        st.html(picker_css)
+    pick, up, down, new, rename, delete = st.columns(
+        [5, 0.4, 0.4, 1.2, 1, 1], vertical_alignment="bottom")
+    pick.selectbox("List", options, format_func=option_label, key=_WL_PICKER_KEY,
+                   on_change=_pick_watchlist, placeholder="Search a list or a ticker",
+                   help="Opens on your lists. Type to search your lists and watched tickers.")
+    if len(ids) > 1:
+        position = ids.index(list_id)
+        up.button("▲", key="wl_list_prev", help="Previous list", disabled=position == 0,
+                  on_click=_step_watchlist, kwargs={"ids": ids, "step": -1}, width="stretch")
+        down.button("▼", key="wl_list_next", help="Next list", disabled=position == len(ids) - 1,
+                    on_click=_step_watchlist, kwargs={"ids": ids, "step": 1}, width="stretch")
+    list_items = items[items["list_id"] == list_id]
+    new.button("＋ New list", key="wl_new_list", on_click=_open_watchlist_dialog,
+               kwargs={"kind": "new_list", "payload": {}}, width="stretch")
+    rename.button("Rename", key="wl_rename_list", on_click=_open_watchlist_dialog,
+                  kwargs={"kind": "rename_list", "payload": {"list_id": list_id, "name": list_name}},
+                  width="stretch")
+    delete.button("Delete", key="wl_delete_list", on_click=_open_watchlist_dialog,
+                  kwargs={"kind": "delete_list", "payload": {
+                      "list_id": list_id, "name": list_name,
+                      "symbols": list(list_items["symbol"])}},
+                  width="stretch")
+
+    if not items.empty:
+        setting, now = state["setting"], state["now"]
+        active = watchlist.is_active(setting=setting, now=now)
+        label_text = watchlist.refresh_label(setting=setting, now=now, tz=watchlist.local_tz())
+        line, update, schedule = st.columns([6, 1.2, 1.6], vertical_alignment="center")
+        fetched = f"Prices fetched {_fetched_text(state=state)}" if state["fetched"] else "Prices not fetched"
+        line.caption(f"{fetched} · updates: {label_text}"
+                     + (" · works only while this page is open" if active else ""))
+        update.button("Update now", key="wl_update_now", on_click=_update_quotes_now, width="stretch")
+        schedule.button("Update schedule", key="wl_schedule", on_click=_open_watchlist_dialog,
+                        kwargs={"kind": "schedule", "payload": {
+                            "label": label_text, "watched": len(items),
+                            "interval_minutes": setting["interval_minutes"] if active else None,
+                            "until": setting["until"] if active else None}},
+                        width="stretch")
+        elsewhere = [f"{names[other]} ({_alert_count(count=count)})"
+                     for other, count in found["by_list"].items() if other != list_id and other in names]
+        if elsewhere:
+            st.caption(f"Alerts in other lists: {', '.join(sorted(elsewhere))}")
+
+    add_kwargs = {"kind": "add_stock", "payload": {"list_id": list_id, "list_name": list_name}}
+    if list_items.empty:
+        st.info(f'"{list_name}" is empty. Add a stock to see its price and set targets.')
+        st.button("＋ Add stock", key="wl_add_stock", on_click=_open_watchlist_dialog, kwargs=add_kwargs)
+        return
+
+    if all(quotes[symbol] is None for symbol in items["symbol"] if symbol in quotes) and quotes:
+        st.warning("Prices could not be fetched (yfinance). Click **Update now** to try again.")
+    if "wl_notice" in st.session_state:
+        st.info(st.session_state["wl_notice"])
+        del st.session_state["wl_notice"]
+
+    frame = watchlist.table(items=list_items, quotes=quotes, positions=positions)
+    order = list(frame["symbol"])
+    table_key = f"wl_table_{list_id}"
+    stored = (list(st.session_state[table_key]["selection"]["rows"])
+              if table_key in st.session_state else None)
+    # A click anywhere in a row arrives as a selected cell; it counts as a click on
+    # that row. The cell is cleared below, so any cell here is a new click.
+    cells = (st.session_state[table_key]["selection"]["cells"]
+             if table_key in st.session_state and "cells" in st.session_state[table_key]["selection"]
+             else [])
+    if cells:
+        stored = [int(cells[0][0])]
+    # What the app wrote is compared only for the same table: another list's rows
+    # would read as a click here.
+    same_table = "wl_table_seen" in st.session_state and st.session_state["wl_table_seen"] == table_key
+    symbol = watchlist.resolve_selection(
+        stored_rows=stored,
+        rows_seen=st.session_state["wl_rows_seen"] if same_table else stored,
+        order_seen=st.session_state["wl_order_seen"] if "wl_order_seen" in st.session_state else [],
+        order=order,
+        symbol=st.session_state[_WL_SYMBOL] if _WL_SYMBOL in st.session_state else None,
+    )
+    st.session_state[_WL_SYMBOL] = symbol
+    # No stock is selected until the user picks one (a row click, ▲ ▼, a search, an alert).
+    index = order.index(symbol) if symbol is not None else None
+    marked = [index] if index is not None else []
+    # Written every run: the highlight follows the stock when rows reorder.
+    st.session_state[table_key] = {"selection": {"rows": marked, "columns": [], "cells": []}}
+    st.session_state["wl_rows_seen"], st.session_state["wl_order_seen"] = marked, order
+    st.session_state["wl_table_seen"] = table_key
+
+    add, edit, up, down, _ = st.columns([1.2, 2.4, 0.5, 0.5, 4])
+    add.button("＋ Add stock", key="wl_add_stock", on_click=_open_watchlist_dialog,
+               kwargs=add_kwargs, width="stretch")
+    if len(order) > 1:
+        up.button("▲", key="wl_symbol_prev", help="Previous stock", disabled=index is None or index == 0,
+                  on_click=_step_watch_symbol, kwargs={"order": order, "step": -1}, width="stretch")
+        down.button("▼", key="wl_symbol_next", help="Next stock", disabled=index == len(order) - 1,
+                    on_click=_step_watch_symbol, kwargs={"order": order, "step": 1}, width="stretch")
+    item = quote = buy_target = sell_target = None
+    if symbol is None:
+        edit.button("Edit / move / remove", key="wl_edit_stock", type="secondary", disabled=True,
+                    help="Click a stock's row first", width="stretch")
+    else:
+        item = list_items[list_items["symbol"] == symbol].iloc[0]
+        quote = quotes[symbol] if symbol in quotes else None
+        buy_target = None if pd.isna(item["buy_target"]) else float(item["buy_target"])
+        sell_target = None if pd.isna(item["sell_target"]) else float(item["sell_target"])
+        # Primary only while a stock is selected: its action is the one the eye lands on.
+        edit.button(f"Edit / move / remove: {symbol}", key="wl_edit_stock", type="primary",
+                    on_click=_open_watchlist_dialog, width="stretch",
+                    kwargs={"kind": "edit_stock", "payload": {
+                        "symbol": symbol, "list_id": list_id, "list_name": list_name,
+                        "buy_target": buy_target, "sell_target": sell_target,
+                        "price": quote["price"] if quote else None,
+                        "currency": quote["currency"] if quote else None,
+                        "lists": list(names.items())}})
+
+    st.dataframe(
+        _watchlist_styler(frame=frame), key=table_key, on_select="rerun",
+        selection_mode=["single-row", "single-cell"], hide_index=True, width="stretch",
+        # Streamlit draws its own text in a missing cell, whatever the Styler says.
+        placeholder="—",
+        column_config={
+            "Above buy": st.column_config.Column(help="How far the price is above your buy target"),
+            "Below sell": st.column_config.Column(help="How far the price is below your sell target"),
+            "Price": st.column_config.Column(help="yfinance quote; may be delayed"),
+        },
+    )
+    st.caption("Click a stock's row, or use ▲ ▼, to see its chart and figures and to edit it.")
+    if symbol is None:
+        return
+
+    st.divider()
+    head, period_col = st.columns([2, 1], vertical_alignment="bottom")
+    head.subheader(symbol)
+    period = period_col.selectbox("Period", _PRICE_PERIODS, index=3, key="wl_period")
+    held = bool(pd.notna(frame.loc[index, "shares"]))
+    _render_price_detail(
+        symbol=symbol, period=period, positions=positions, cash_tx=cash_tx, trades=trades,
+        key_prefix="wl", layout="watchlist", quote=quote,
+        buy_target=buy_target, sell_target=sell_target, show_position=held,
     )
 
 
@@ -544,6 +1494,7 @@ _DIV_CSS = """
   --declared: rgba(250,178,25,0.22); --declared-dot: #d99a0e;
   --expected: #ec835a; --accent: #2a78d6; --accent-tint: rgba(42,120,214,0.08);
   --bar: #86b6ef; --hover: color-mix(in srgb, var(--surface) 95%, var(--ink));
+  --sell: #d93a4a;
   font-family: system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--ink);
 }
 .divcal-root.dark {
@@ -553,6 +1504,7 @@ _DIV_CSS = """
   --declared: rgba(250,178,25,0.18); --declared-dot: #fab219;
   --expected: #ec835a; --accent: #3987e5; --accent-tint: rgba(57,135,229,0.10);
   --bar: #256abf; --hover: color-mix(in srgb, var(--surface) 94%, var(--ink));
+  --sell: #f0616d;
 }
 .divcal-legend { display: flex; flex-wrap: wrap; gap: 18px; margin: 0 0 10px; font-size: 12.5px; color: var(--ink-2); }
 .divcal-legend span { display: inline-flex; align-items: center; gap: 7px; }
@@ -560,8 +1512,10 @@ _DIV_CSS = """
 .divcal-legend .sw-paid { background: var(--paid); box-shadow: inset 0 0 0 1px var(--paid-dot); }
 .divcal-legend .sw-declared { background: var(--declared); box-shadow: inset 0 0 0 1px var(--declared-dot); }
 .divcal-legend .sw-expected { outline: 1px dashed var(--expected); outline-offset: -1px; }
-.divcal-legend .sw-buy { width: 0; height: 0; background: none; border-left: 5px solid transparent;
-  border-right: 5px solid transparent; border-bottom: 8px solid var(--accent); border-radius: 0; }
+.divcal-legend .sw-buy, .divcal-legend .sw-sell { width: 0; height: 0; background: none; border-radius: 0;
+  border-left: 5px solid transparent; border-right: 5px solid transparent; }
+.divcal-legend .sw-buy { border-bottom: 8px solid var(--accent); }
+.divcal-legend .sw-sell { border-top: 8px solid var(--sell); }
 .divcal-legend .sw-current { background: var(--accent-tint); box-shadow: inset 2px 0 0 var(--accent), inset -2px 0 0 var(--accent); }
 
 /* Scrollable viewport: past ~70% of the screen the table scrolls, with month
@@ -591,21 +1545,25 @@ _DIV_CSS = """
   outline: 1px dashed var(--expected); outline-offset: -6px; border-radius: 8px; }
 .divcal .nodata { color: var(--muted); font-style: italic; text-align: center; }
 
-/* Buy markers: a small triangle on the cell's bottom edge at the day of the
-   month the buy happened; hover opens a panel with the trade details. */
+/* Trade markers: a small triangle on the cell's bottom edge at the day of the
+   month the trade happened — blue pointing up for a buy, red pointing down for
+   a sell; hover opens a panel with the trade details. */
 .divcal tbody td { position: relative; }
-.divcal .buy { position: absolute; bottom: 2px; width: 10px; height: 8px; margin-left: -5px;
+.divcal .trade { position: absolute; bottom: 2px; width: 10px; height: 8px; margin-left: -5px;
   cursor: pointer; z-index: 4; }
-.divcal .buy::before { content: ""; position: absolute; left: 1px; bottom: 0; border-left: 4px solid transparent;
-  border-right: 4px solid transparent; border-bottom: 6px solid var(--accent); }
-.divcal .buytip { display: none; position: absolute; top: 10px; left: 50%; transform: translateX(-50%);
+.divcal .trade::before { content: ""; position: absolute; left: 1px; bottom: 0; border-left: 4px solid transparent;
+  border-right: 4px solid transparent; }
+.divcal .trade.buy::before { border-bottom: 6px solid var(--accent); }
+.divcal .trade.sell::before { border-top: 6px solid var(--sell); }
+.divcal .tradetip { display: none; position: absolute; top: 10px; left: 50%; transform: translateX(-50%);
   z-index: 20; min-width: 180px; padding: 8px 10px; border-radius: 8px; text-align: left; white-space: nowrap;
   background: var(--surface-2); color: var(--ink); border: 1px solid var(--line-strong);
   box-shadow: 0 6px 18px rgba(0,0,0,.25); font-size: 12px; font-weight: 400; line-height: 1.5; }
-.divcal .buytip b { font-weight: 650; }
-.divcal .buy:hover .buytip { display: block; }
+.divcal .tradetip b { font-weight: 650; }
+.divcal .trade:hover .tradetip { display: block; }
 .divcal tr.sold th, .divcal tr.sold td { color: var(--muted); }
 .divcal .held { font-size: 11px; font-weight: 500; color: var(--muted); margin-left: 4px; }
+.divcal .nodiv { font-size: 11px; font-weight: 400; font-style: italic; color: var(--muted); margin-left: 6px; }
 .divcal .soldtag { font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; margin-left: 4px; }
 
 .divcal th.tickertotal, .divcal td.tickertotal { font-weight: 700; border-right: 1px solid var(--line-strong); }
@@ -625,7 +1583,8 @@ _DIV_LEGEND = (
     '<span><i class="sw-declared"></i>Declared, not paid yet</span>'
     '<span><i class="sw-expected"></i>Expected (estimated from history)</span>'
     '<span><i class="sw-current"></i>Current month</span>'
-    '<span><i class="sw-buy"></i>Bought (hover for details)</span>'
+    '<span><i class="sw-buy"></i>Bought</span>'
+    '<span><i class="sw-sell"></i>Sold (hover a marker for details)</span>'
     "</div>"
 )
 
@@ -643,22 +1602,25 @@ def _money(*, value: float | None, currency: str | None) -> str:
     return f"{value:,.2f} {currency or ''}".strip()
 
 
-def _buy_marker(*, buy: dict) -> str:
-    """One buy triangle with its hover panel."""
-    qty = dividends.format_qty(value=buy["quantity"])
-    ccy = buy.get("currency")
+def _trade_marker(*, trade: dict) -> str:
+    """One buy or sell triangle with its hover panel."""
+    qty = dividends.format_qty(value=trade["quantity"])
+    ccy = trade.get("currency")
+    sell = trade["side"] == "SELL"
     details = [
-        f"Holding after: {dividends.format_qty(value=buy['holding'])} sh",
-        f"Price: {_money(value=buy['price'], currency=ccy)}",
-        f"Cost: {_money(value=buy['cost'], currency=ccy)}",
-        f"Commission: {_money(value=buy['commission'], currency=ccy)}",
+        f"Holding after: {dividends.format_qty(value=trade['holding'])} sh",
+        f"Price: {_money(value=trade['price'], currency=ccy)}",
+        f"{'Proceeds' if sell else 'Cost'}: {_money(value=trade['amount'], currency=ccy)}",
+        f"Commission: {_money(value=trade['commission'], currency=ccy)}",
     ]
-    if buy["fills"] > 1:
-        details.append(f"{buy['fills']} fills (average price)")
-    head = f"<b>Bought {html.escape(qty)} sh</b> · {buy['date']:%d-%m-%Y}"
+    if sell and trade["realized_pnl"] is not None:
+        details.append(f"Realized P&L: {_money(value=trade['realized_pnl'], currency=ccy)}")
+    if trade["fills"] > 1:
+        details.append(f"{trade['fills']} fills (average price)")
+    head = f"<b>{'Sold' if sell else 'Bought'} {html.escape(qty)} sh</b> · {trade['date']:%d-%m-%Y}"
     body = "<br>".join([head, *(html.escape(line) for line in details)])
-    return (f'<span class="buy" style="left:{100 * buy["pos"]:.1f}%">'
-            f'<span class="buytip">{body}</span></span>')
+    return (f'<span class="trade {"sell" if sell else "buy"}" style="left:{100 * trade["pos"]:.1f}%">'
+            f'<span class="tradetip">{body}</span></span>')
 
 
 def _ticker_label(*, cal: dividends.Calendar, sym: str) -> str:
@@ -675,7 +1637,7 @@ def _calendar_html(cal: dividends.Calendar, dark: bool, marks: dict) -> str:
     """Render the calendar as an HTML table: status tints, current-month
     highlight, native hover tooltips (title), a per-ticker Total column with a
     magnitude bar, and a Total footer row. ``dark`` follows the app theme.
-    ``marks`` (``dividends.buy_marks``) adds a hoverable triangle per buy."""
+    ``marks`` (``dividends.trade_marks``) adds a hoverable triangle per buy or sell."""
     cols = list(cal.values.columns)
     cur = cal.current_ym
     top = max(
@@ -692,7 +1654,10 @@ def _calendar_html(cal: dividends.Calendar, dark: bool, marks: dict) -> str:
         pct = _pct(tot, top)
         style = f' style="--pct:{pct}"' if pct else ""
         total = f'<td class="tickertotal"{style}>{html.escape(tot)}</td>'
-        if sym in cal.no_data:
+        sym_marks = marks.get(sym, {})
+        # A ticker that pays nothing still has buys and sells worth showing: with
+        # trades in view it gets normal month cells, so each marker sits in its month.
+        if sym in cal.no_data and not sym_marks:
             rows.append(
                 f'<tr><th>{_ticker_label(cal=cal, sym=sym)}</th>{total}'
                 f'<td class="nodata" colspan="{len(cols)}">— no dividends —</td></tr>'
@@ -705,11 +1670,14 @@ def _calendar_html(cal: dividends.Calendar, dark: bool, marks: dict) -> str:
                 klass = f"{klass} current".strip()
             tip = cal.tooltips.at[sym, c]
             title = f' title="{html.escape(tip)}"' if tip else ""
-            buys = "".join(_buy_marker(buy=b) for b in marks.get(sym, {}).get(c, []))
+            trades = "".join(_trade_marker(trade=t) for t in sym_marks.get(c, []))
             cells.append(
-                f'<td class="{klass}"{title}>{html.escape(str(cal.values.at[sym, c]))}{buys}</td>'
+                f'<td class="{klass}"{title}>{html.escape(str(cal.values.at[sym, c]))}{trades}</td>'
             )
-        if sym in cal.sold:
+        if sym in cal.no_data:
+            label = f'{_ticker_label(cal=cal, sym=sym)} <span class="nodiv">no dividends</span>'
+            rows.append(f'<tr><th>{label}</th>{total}{"".join(cells)}</tr>')
+        elif sym in cal.sold:
             label = f'{html.escape(str(sym))} <span class="soldtag">sold</span>'
             rows.append(f'<tr class="sold"><th>{label}</th>{total}{"".join(cells)}</tr>')
         else:
@@ -869,10 +1837,12 @@ def tab_dividends(data: dict) -> None:
     first_buy = dividends.first_buy_month(trades=data.get("trades"), symbols=list(cal.values.index))
     if months is None and first_buy is not None:
         cal = dividends.extend_back(cal=cal, first_ym=first_buy)
-    marks = dividends.buy_marks(
+    marks = dividends.trade_marks(
         trades=data.get("trades"), symbols=list(cal.values.index),
         columns=list(cal.values.columns), shares=cal.shares,
     )
+    # A ticker sold before the first month shown was not in the portfolio then.
+    cal = dividends.drop_absent_sold(cal=cal, marks=marks)
     st.html(_calendar_html(cal, dark=st.context.theme.type == "dark", marks=marks))
 
     with st.expander("How to read this calendar"):
@@ -891,12 +1861,424 @@ def tab_dividends(data: dict) -> None:
             "(declared amounts) and yfinance (dates only), and the tooltip shows "
             "the source.\n"
             "- “No dividends” rows are held tickers that pay none.\n"
-            "- Rows marked **sold** are tickers you no longer hold. Their past "
+            "- **Triangles** on a cell's bottom edge mark trades on that day of the "
+            "month: blue pointing up = bought, red pointing down = sold. Hover one "
+            "for price, amount and shares held after.\n"
+            "- Rows marked **sold** are tickers you no longer hold. A sold ticker is listed "
+            "only when the months shown include a dividend or a trade of it. Their past "
             "payments count in every total; nothing is projected for them.\n"
             "- After tax is the cash that landed: the dividend minus IBKR's "
             "withholding. The same numbers feed Net Worth, Prices and Positions."
         )
 
+
+# ---- performance calendar ---------------------------------------------------
+
+# The chosen period, (first month, last month), kept outside the slider widget.
+# Buttons and month rows change the period by writing it here and bumping the
+# sequence number in the slider's key: Streamlit then builds a fresh slider
+# that starts on the new period. Writing to the slider's own key instead would
+# clash with its ``value`` — which a range slider cannot do without — and
+# Streamlit logs a warning for that on every such change.
+_PERF_PERIOD_KEY = "perf_period"
+_PERF_SLIDER_SEQ_KEY = "perf_period_seq"
+_PERF_SLIDER_KEY_PREFIX = "perf_period_slider_"
+
+
+def _set_perf_period(*, period: tuple[str, str]) -> None:
+    """Callback helper: choose a period and make the slider restart on it."""
+    st.session_state[_PERF_PERIOD_KEY] = period
+    seq = st.session_state[_PERF_SLIDER_SEQ_KEY] if _PERF_SLIDER_SEQ_KEY in st.session_state else 0
+    st.session_state[_PERF_SLIDER_SEQ_KEY] = seq + 1
+
+_PERF_PRESET_KEY = "perf_preset"
+# Quick periods, all ending on the newest month: a number of months, the newest
+# month's calendar year so far, or everything.
+_PERF_PRESET_MONTHS = {"1M": 1, "3M": 3, "6M": 6, "1Y": 12}
+_PERF_PRESETS = (*_PERF_PRESET_MONTHS, "YTD", "All")
+
+
+def _month_key(*, year: int, month: int) -> str:
+    return f"{year:04d}-{month:02d}"
+
+
+def _month_label(key: str) -> str:
+    year, month = key.split("-")
+    return f"{calendar.month_name[int(month)]} {year}"
+
+
+def _month_options(*, months: list[tuple[int, int]]) -> list[str]:
+    """Every month from the first to the last one with data, oldest first, so
+    the period slider has no holes."""
+    (year, month), last = min(months), max(months)
+    out = []
+    while (year, month) <= last:
+        out.append(_month_key(year=year, month=month))
+        year, month = (year + 1, 1) if month == 12 else (year, month + 1)
+    return out
+
+
+def _preset_period(*, options: list[str], preset: str) -> tuple[str, str]:
+    """First and last month of a quick period."""
+    last = options[-1]
+    if preset == "All":
+        return options[0], last
+    if preset == "YTD":
+        return next(option for option in options if option[:4] == last[:4]), last
+    return options[max(len(options) - _PERF_PRESET_MONTHS[preset], 0)], last
+
+
+def _apply_perf_preset(*, options: list[str]) -> None:
+    """Quick-period callback: move the slider to the picked period. A click on
+    the already-picked period clears the pick; it is restored on the next run
+    (see ``_matching_preset``), so the period in force always stays marked."""
+    preset = st.session_state.get(_PERF_PRESET_KEY)
+    if preset:
+        _set_perf_period(period=_preset_period(options=options, preset=preset))
+
+
+def _matching_preset(*, options: list[str], period: tuple[str, str], picked: str | None) -> str | None:
+    """The quick period to show as selected for ``period``, or None when the
+    period is none of them (set by the slider, the arrows or a month row).
+
+    Several quick periods can be the same months (with ten months of data, YTD
+    and 1Y are both everything): the one the user picked wins, else the first.
+    """
+    matches = [preset for preset in _PERF_PRESETS
+               if _preset_period(options=options, preset=preset) == period]
+    if picked in matches:
+        return picked
+    return matches[0] if matches else None
+
+
+def _shift_perf_period(*, options: list[str], step: int) -> None:
+    """Arrow callback: slide the whole period ``step`` months, keeping its length."""
+    start, end = (options.index(key) for key in st.session_state[_PERF_PERIOD_KEY])
+    step = max(-start, min(step, len(options) - 1 - end))
+    _set_perf_period(period=(options[start + step], options[end + step]))
+
+
+def _open_perf_month(*, month_key: str) -> None:
+    """Month row callback: narrow the period to that month."""
+    _set_perf_period(period=(month_key, month_key))
+
+
+_PERF_DAY_KEY = "perf_day_open"
+
+
+def _open_perf_day(*, day: str) -> None:
+    """Day tile callback: show that day's details."""
+    st.session_state[_PERF_DAY_KEY] = day
+
+
+def _close_perf_day() -> None:
+    """on_dismiss callback: the day dialog was closed with X, Esc or a click outside."""
+    if _PERF_DAY_KEY in st.session_state:
+        del st.session_state[_PERF_DAY_KEY]
+
+
+def _day_trades(*, trades: pd.DataFrame | None, date: dt.date) -> pd.DataFrame:
+    """The day's fills as a table."""
+    cols = {"side": "Side", "symbol": "Ticker", "quantity": "Quantity", "price": "Price",
+            "commission": "Commission"}
+    if trades is None or trades.empty or "trade_date" not in trades:
+        return pd.DataFrame(columns=list(cols.values()))
+    rows = trades[pd.to_datetime(trades["trade_date"]).dt.date == date]
+    return rows[[c for c in cols if c in rows]].rename(columns=cols)
+
+
+@st.dialog("Day details", width="large", on_dismiss=_close_perf_day)
+def perf_day_dialog(
+    *, row: dict, detail: dict, symbols: list[dict], trades: pd.DataFrame, currency: str | None,
+) -> None:
+    """What moved the account on one day: per-ticker P&L, then everything else."""
+    date = row["date"]
+    unit = f" {currency}" if currency else ""
+    st.subheader(f"{date:%A}, {date.day} {date:%B %Y}")
+    pnl = None if pd.isna(row["pnl"]) else float(row["pnl"])
+    ret = None if pd.isna(row["ret"]) else float(row["ret"])
+    cols = st.columns(4)
+    cols[0].metric("Return", perf_calendar.fmt_pct(ret=ret))
+    cols[1].metric(f"P&L ({currency})" if currency else "P&L", perf_calendar.fmt_money(value=pnl))
+    cols[2].metric("Close", f"{row['nav']:,.2f}")
+    cols[3].metric("Previous close", "—" if pd.isna(row["prev_nav"]) else f"{row['prev_nav']:,.2f}")
+
+    if symbols:
+        st.markdown("**P&L by ticker**")
+        st.plotly_chart(figures.day_symbols_bar(rows=symbols, currency=currency), width="stretch")
+        held = sum(item["pnl"] for item in symbols)
+        if pnl is not None:
+            st.dataframe(pd.DataFrame([
+                {"Source": "Shares held coming into the day", "Amount": round(held, 2)},
+                {"Source": "Everything else: shares traded that day, dividends, interest, "
+                           "fees, currency", "Amount": round(pnl - held, 2)},
+                {"Source": "Day total", "Amount": round(pnl, 2)},
+            ]), width="stretch", hide_index=True)
+        st.dataframe(pd.DataFrame([{
+            "Ticker": item["symbol"], "Name": item["description"],
+            "Close price": item["price"], "Previous price": item["prev_price"],
+            "Price change %": None if item["pct"] is None else round(item["pct"] * 100, 2),
+            "P&L": round(item["pnl"], 2),
+        } for item in symbols]), width="stretch", hide_index=True)
+    else:
+        st.info("IBKR has no per-ticker figures for this day.")
+
+    events = []
+    if abs(row["flow"]) >= performance.FLAT_EPSILON:
+        events.append(f"- {'Deposit' if row['flow'] > 0 else 'Withdrawal'}: "
+                      f"{abs(row['flow']):,.2f}{unit} (not counted in the day's P&L)")
+    if abs(detail["dividends"]) >= performance.FLAT_EPSILON:
+        events.append(f"- Dividends received: {detail['dividends']:,.2f}{unit}")
+    if abs(detail["fees"]) >= performance.FLAT_EPSILON:
+        events.append(f"- Fees: {detail['fees']:,.2f}{unit} (already inside the day's P&L)")
+    if events:
+        st.markdown("**Cash events**\n" + "\n".join(events))
+    if not trades.empty:
+        st.markdown("**Trades**")
+        st.dataframe(trades, width="stretch", hide_index=True)
+
+
+def _render_perf_month(*, weeks: list[dict], currency: str | None, dark: bool) -> None:
+    """The month as a grid of day tiles; a day with a close opens its details."""
+    st.html(perf_calendar.legend_html(dark=dark))
+    names = (*perf_calendar.WEEKDAY_NAMES, "Week")
+    with st.container(gap="xsmall"):
+        for col, name in zip(st.columns(len(names), gap="xsmall"), names):
+            col.html(perf_calendar.weekday_head_html(name=name, dark=dark))
+        for index, week in enumerate(weeks):
+            vertical = "up" if index >= max(len(weeks) - perf_calendar.PANEL_UP_ROWS, 1) else ""
+            cols = st.columns(len(names), gap="xsmall")
+            for column, cell in enumerate(week["days"]):
+                horizontal = "right" if column >= perf_calendar.PANEL_RIGHT_FROM else ""
+                tile = perf_calendar.day_tile_html(
+                    cell=cell, currency=currency, dark=dark,
+                    position=f"{vertical} {horizontal}".strip(),
+                )
+                if not perf_calendar.has_result(cell=cell):
+                    cols[column].html(tile)
+                    continue
+                day = cell["date"].isoformat()
+                suffix = day.replace("-", "_")
+                with cols[column].container(key=f"{perf_calendar.DAY_KEY_PREFIX}{suffix}"):
+                    st.html(tile)
+                    st.button(
+                        f"Open {perf_calendar.fmt_date(date=cell['date'])}",
+                        key=f"{perf_calendar.DAY_OPEN_KEY_PREFIX}{suffix}",
+                        on_click=_open_perf_day, kwargs={"day": day},
+                    )
+            cols[-1].html(perf_calendar.week_tile_html(summary=week["summary"], dark=dark))
+
+
+def _render_perf_rows(*, months: list[dict], with_data: set[str], dark: bool) -> None:
+    """One row per month of the period; a row with data opens its month when clicked."""
+    st.html(perf_calendar.rows_legend_html(dark=dark))
+    for month in months:
+        key = _month_key(year=month["year"], month=month["month"])
+        suffix = key.replace("-", "_")
+        with st.container(key=f"{perf_calendar.ROW_KEY_PREFIX}{suffix}"):
+            st.html(perf_calendar.month_row_html(month=month, dark=dark))
+            if key in with_data:
+                st.button(
+                    f"Open {_month_label(key)}", key=f"{perf_calendar.OPEN_KEY_PREFIX}{suffix}",
+                    on_click=_open_perf_month, kwargs={"month_key": key},
+                )
+
+
+def _perf_day_text(*, day: dict | None) -> tuple[str, str | None]:
+    """(value, help) for a best / worst day metric."""
+    if day is None:
+        return "—", None
+    unit = perf_calendar.fmt_money(value=day["pnl"])
+    return perf_calendar.fmt_pct(ret=day["ret"]), f"{perf_calendar.fmt_date(date=day['date'])}: {unit}"
+
+
+def _perf_metrics(*, summary: dict, fees: float, currency: str | None) -> None:
+    cols = st.container(key=perf_calendar.METRICS_KEY).columns(6)
+    cols[0].metric(
+        "Return", perf_calendar.fmt_pct(ret=summary["ret"]), border=True,
+        help="Daily returns linked together (time-weighted), so deposits do not count as gains.",
+    )
+    pnl = summary["pnl"]
+    # Currency goes in the label: in the value it gets cut off at this width.
+    cols[1].metric(
+        f"P&L ({currency})" if currency else "P&L",
+        perf_calendar.fmt_money(value=pnl),
+        border=True, help="Change in net asset value, minus deposits and plus withdrawals.",
+    )
+    for col, label, key in ((cols[2], "Best day", "best"), (cols[3], "Worst day", "worst")):
+        value, date = _perf_day_text(day=summary[key])
+        col.metric(label, value, delta=date and date.split(":")[0], delta_color="off",
+                   delta_arrow="off", border=True, help=date)
+    cols[4].metric(
+        "Up days", f"{summary['up_days']} / {summary['days']}" if summary["days"] else "—",
+        border=True, help="Days that closed with a gain, out of the days with a close.",
+    )
+    cols[5].metric(
+        f"Fees ({currency})" if currency else "Fees", f"{fees:,.2f}", border=True,
+        help="Trade commissions and broker fees charged in the period. They are already "
+             "inside the profit / loss, not on top of it.",
+    )
+
+
+def _perf_table(
+    *, daily: pd.DataFrame, fees: dict[dt.date, float], start: dt.date, end: dt.date,
+) -> pd.DataFrame:
+    """The period's days as a plain table: the same numbers as the calendar."""
+    rows = daily[(daily["date"] >= start) & (daily["date"] <= end)]
+    return pd.DataFrame({
+        "Date": [perf_calendar.fmt_date(date=d) for d in rows["date"]],
+        "Close": rows["nav"].round(2).to_list(),
+        "Change": pd.to_numeric(rows["pnl"]).round(2).to_list(),
+        "Return %": (pd.to_numeric(rows["ret"]) * 100).round(2).to_list(),
+        "Deposit / withdrawal": rows["flow"].round(2).to_list(),
+        "Fees": [round(fees.get(d, 0.0), 2) for d in rows["date"]],
+    })
+
+
+def tab_performance(*, data: dict) -> None:
+    st.subheader("Daily performance")
+
+    stored = snapshots.read_equity_daily(db_path=settings.db_path)
+    nav_history = snapshots.read_history(settings.db_path)
+    daily = performance.daily(
+        closes=performance.closes(equity=data.get("equity"), stored=stored, nav_history=nav_history),
+        flows=performance.flows_by_day(cash_tx=data.get("cash_tx")),
+    )
+    months = performance.months(daily=daily)
+    if len(daily) < 2 or not months:
+        _close_perf_day()   # a flag with no dialog would block the watchlist's auto update
+        st.info("Not enough daily closes yet. The calendar needs at least two trading days "
+                "of net asset value from IBKR.")
+        return
+
+    with_data = {_month_key(year=year, month=month) for year, month in months}
+    options = _month_options(months=months)
+    st.html(perf_calendar.styles_html())
+
+    # Period: a two-handle slider over the months, arrows that slide the whole
+    # period by a month, and quick periods. Callbacks set the slider before the
+    # next run; no st.rerun() (see render_sidebar).
+    period = st.session_state[_PERF_PERIOD_KEY] if _PERF_PERIOD_KEY in st.session_state else None
+    # A new session (or a period the data no longer covers) opens on everything.
+    if period is None or period[0] not in options or period[1] not in options:
+        period = _preset_period(options=options, preset="All")
+        # Mark All itself: with a year of data or less, shorter quick periods
+        # are the same months and would otherwise take the mark.
+        st.session_state[_PERF_PRESET_KEY] = "All"
+    start_key, end_key = period
+    if len(options) > 1:
+        older, slider, newer = st.columns([0.6, 10, 0.6], vertical_alignment="bottom")
+        seq = st.session_state[_PERF_SLIDER_SEQ_KEY] if _PERF_SLIDER_SEQ_KEY in st.session_state else 0
+        start_key, end_key = slider.select_slider(
+            "Period", options=options, value=period, format_func=_month_label,
+            key=f"{_PERF_SLIDER_KEY_PREFIX}{seq}",
+            help="Drag both ends to choose the months. One month shows its days; "
+                 "several months show one row per month.",
+        )
+    # Remember a period dragged by hand, so the arrows move from it.
+    st.session_state[_PERF_PERIOD_KEY] = (start_key, end_key)
+    if len(options) > 1:
+        older.button(
+            "◀", key="perf_older", help="One month back", disabled=start_key == options[0],
+            on_click=_shift_perf_period, kwargs={"options": options, "step": -1}, width="stretch",
+        )
+        newer.button(
+            "▶", key="perf_newer", help="One month forward", disabled=end_key == options[-1],
+            on_click=_shift_perf_period, kwargs={"options": options, "step": 1}, width="stretch",
+        )
+        # Mark the quick period that equals the period in force, whichever
+        # control set it, and none when the period is a custom one.
+        st.session_state[_PERF_PRESET_KEY] = _matching_preset(
+            options=options, period=(start_key, end_key),
+            picked=st.session_state[_PERF_PRESET_KEY] if _PERF_PRESET_KEY in st.session_state else None,
+        )
+        st.pills(
+            "Quick period", _PERF_PRESETS, key=_PERF_PRESET_KEY, label_visibility="collapsed",
+            on_change=_apply_perf_preset, kwargs={"options": options},
+        )
+
+    chosen = [tuple(int(part) for part in key.split("-"))
+              for key in options[options.index(start_key):options.index(end_key) + 1]]
+    start = performance.month_range(year=chosen[0][0], month=chosen[0][1])[0]
+    end = performance.month_range(year=chosen[-1][0], month=chosen[-1][1])[1]
+    today = dt.date.today()
+    currency = data.get("account", {}).get("currency") or data.get("nav", {}).get("currency")
+    symbol_days = performance.symbol_days(
+        statement=data.get("symbols"), stored=snapshots.read_symbol_daily(db_path=settings.db_path),
+    )
+    details = performance.day_details(
+        cash_tx=data.get("cash_tx"), trades=data.get("trades"),
+        movers=performance.movers(symbol_days=symbol_days),
+    )
+    fees = performance.fees_by_day(trades=data.get("trades"), cash_tx=data.get("cash_tx"))
+    dark = st.context.theme.type == "dark"
+
+    title = _month_label(start_key)
+    if end_key != start_key:
+        title = f"{title} – {_month_label(end_key)} ({len(chosen)} months)"
+    st.markdown(f"**{title}**")
+    _perf_metrics(
+        summary=performance.summary(daily=daily, start=start, end=end),
+        fees=performance.fees_total(fees=fees, start=start, end=end), currency=currency,
+    )
+    if len(chosen) == 1:
+        year, month = chosen[0]
+        _render_perf_month(
+            weeks=performance.month_weeks(daily=daily, details=details, year=year, month=month, today=today),
+            currency=currency, dark=dark,
+        )
+    else:
+        _render_perf_rows(
+            months=performance.period_months(
+                daily=daily, details=details, fees=fees, months=chosen, today=today,
+            ),
+            with_data=with_data, dark=dark,
+        )
+
+    if _PERF_DAY_KEY in st.session_state:
+        day = dt.date.fromisoformat(st.session_state[_PERF_DAY_KEY])
+        rows = daily[daily["date"] == day].to_dict("records")
+        if rows:
+            blank = {"dividends": 0.0, "fees": 0.0}
+            perf_day_dialog(
+                row=rows[0], detail=details[day] if day in details else blank,
+                symbols=performance.day_symbols(symbol_days=symbol_days, date=day),
+                trades=_day_trades(trades=data.get("trades"), date=day), currency=currency,
+            )
+        else:
+            _close_perf_day()
+
+    with st.expander("How to read this calendar"):
+        st.markdown(
+            "- Each cell is one trading day: the **percent** is that day's return, the "
+            "amount under it is the profit or loss in the account's base currency.\n"
+            "- A day is measured from the previous close to its own close. Monday is "
+            "measured from Friday.\n"
+            "- **Deposits and withdrawals are taken out**, so adding money never looks "
+            "like a gain. A ring in the corner marks those days.\n"
+            "- Dividends and interest are part of the return.\n"
+            "- **Fees** are trade commissions and broker fees. They are already inside "
+            "the profit or loss; the Fees figure only shows how much they were.\n"
+            "- **Colour** shows direction (green up, red down) and strength: four steps at "
+            "0.25%, 0.75% and 1.5%. The arrow and the sign say the same thing without colour.\n"
+            "- **Week**, month and year figures link the daily returns together; they are "
+            "not a sum of the percents.\n"
+            "- **No data**: a weekday with no close from IBKR. The next day's figure then "
+            "covers both days. **Pending**: no close yet (today).\n"
+            "- Hover a day for the close, the best and worst ticker of the day (by price "
+            "change), the deposit, dividends received, fees and trades. **Click a day** for "
+            "its details: P&L by ticker and the day's trades.\n"
+            "- **Period**: drag the slider's two ends, use ◀ ▶ to move the period by a "
+            "month, or pick a quick period. Several months show one row per month: "
+            "the line is the return since the month's start, day by day. Click a row to open "
+            "that month."
+        )
+    with st.expander("Daily table"):
+        st.dataframe(_perf_table(daily=daily, fees=fees, start=start, end=end),
+                     width="stretch", hide_index=True)
+
+
+# ---- net worth --------------------------------------------------------------
 
 def _clip_nav_table(nav_history: pd.DataFrame, range_label: str) -> pd.DataFrame:
     """The snapshot table, limited to the selected range."""
@@ -1136,6 +2518,8 @@ def connect_dialog(*, query_id_missing: bool) -> None:
         values["FLEX_QUERY_ID"] = query_id
     save_env_values(env_path=ENV_PATH, values=values)
     del st.session_state[_CONNECT_OPEN]
+    if _FLEX_FAILED in st.session_state:
+        del st.session_state[_FLEX_FAILED]
     st.session_state[_CONNECT_SAVED] = True
     st.cache_data.clear()
     st.rerun()
@@ -1236,58 +2620,104 @@ def render_sync_details(*, report: dict) -> None:
 
 # ---- main -----------------------------------------------------------------
 
+_RETRY_HINT = ("IBKR is not asked again automatically. Click **Refresh data** in the sidebar "
+               "to retry.")
+
+
+def _render_offline_tabs(*, watch_state: dict) -> None:
+    """Without IBKR data the watchlist (yfinance only) and Net Worth (local
+    history) still work."""
+    empty = pd.DataFrame()
+    watch_tab, net_worth = st.tabs(["Watchlist", "Net Worth"], key="tabs_offline")
+    with watch_tab:
+        tab_watchlist(state=watch_state, positions=empty, cash_tx=empty, trades=empty,
+                      connected=False)
+    with net_worth:
+        render_net_worth_or_hint()
+
+
 def main() -> None:
     sidebar_status = render_sidebar()
     st.title("📈 IBKR Dashboard")
     if _CONNECT_SAVED in st.session_state:
         del st.session_state[_CONNECT_SAVED]
         st.success("Connected to IBKR.")
+    if "wl_toast" in st.session_state:
+        st.toast(st.session_state["wl_toast"])
+        del st.session_state["wl_toast"]
+
+    watch_state = _watchlist_state()
+    # Order matters: the tick must find this run's bucket, and must not rerun
+    # while this (full) run is still rendering.
+    st.session_state["wl_bucket_seen"] = watch_state["bucket"]
+    st.session_state["wl_tick_armed"] = False
+    st.fragment(_watchlist_tick, run_every=watchlist.refresh_seconds(
+        setting=watch_state["setting"], now=watch_state["now"]))()
 
     if not settings.is_configured:
+        if _FLEX_FAILED in st.session_state:
+            del st.session_state[_FLEX_FAILED]
+        _close_perf_day()
         sidebar_status.warning("IBKR: not connected")
+        _render_watchlist_alerts(state=watch_state)
         render_connect_card(code=None, query_id_missing=not is_real_value(settings.flex_query_id))
-        render_net_worth_or_hint()
+        st.caption("Save a token above to connect.")
+        _render_offline_tabs(watch_state=watch_state)
         return
 
-    try:
-        data = load_portfolio(
-            token=settings.flex_token, query_id=settings.flex_query_id,
-            db_path_str=str(settings.db_path), session=session_key(),
-        )
-    except flex.FlexError as exc:
-        if exc.code in flex.TOKEN_ERROR_CODES:
-            sidebar_status.error(f"IBKR: {_SIDEBAR_TOKEN_STATUS[exc.code]}")
-            render_connect_card(code=exc.code, query_id_missing=False)
-        else:
-            sidebar_status.error("IBKR: download failed")
+    data = None
+    if _FLEX_FAILED not in st.session_state:
+        try:
+            data = load_portfolio(
+                token=settings.flex_token, query_id=settings.flex_query_id,
+                db_path_str=str(settings.db_path), session=session_key(),
+            )
+        except flex.FlexError as exc:
             msg = str(exc)
             # ibflex embeds the token in request URLs, and the raised FlexError
-            # text is intentionally unscrubbed — never show the token on screen.
+            # text is intentionally unscrubbed — never keep or show the token.
             if settings.flex_token:
                 msg = msg.replace(settings.flex_token, "***")
-            st.error(msg)
-            st.info("Fix the token/query in `.env`, then click **Refresh data**.")
-        # Net Worth still works from prior snapshots — keep the history reachable
-        # while the credential is being fixed.
+            st.session_state[_FLEX_FAILED] = {"code": exc.code, "message": msg}
+    if data is None:
+        failed = st.session_state[_FLEX_FAILED]
+        _close_perf_day()
+        _render_watchlist_alerts(state=watch_state)
+        if failed["code"] in flex.TOKEN_ERROR_CODES:
+            sidebar_status.error(f"IBKR: {_SIDEBAR_TOKEN_STATUS[failed['code']]}")
+            render_connect_card(code=failed["code"], query_id_missing=False)
+            st.caption("Save a token above to connect.")
+        else:
+            sidebar_status.error("IBKR: download failed")
+            st.error(failed["message"])
+            st.info(f"Fix the token/query in `.env` if needed. {_RETRY_HINT}")
+        # Watchlist and Net Worth still work — keep them reachable while the
+        # credential is being fixed.
         st.sidebar.caption("DB sync: not checked (pull failed)")
-        render_net_worth_or_hint()
+        _render_offline_tabs(watch_state=watch_state)
         return
 
     sidebar_status.success("IBKR: connected")
     render_sync_status(report=data["sync"])
-    overview, positions, trades, price, divs, net_worth = st.tabs(
-        ["Overview", "Positions", "Trades", "Prices", "Dividends", "Net Worth"]
+    overview, positions, trades, price, watch, divs, perf, net_worth = st.tabs(
+        ["Overview", "Positions", "Trades", "Prices", "Watchlist", "Dividends", "Performance",
+         "Net Worth"], key="tabs_main",
     )
     with overview:
-        tab_overview(data)
+        tab_overview(data, watch_state=watch_state)
     with positions:
         tab_positions(data)
     with trades:
         tab_trades(data)
     with price:
         tab_prices(data)
+    with watch:
+        tab_watchlist(state=watch_state, positions=data["positions"], cash_tx=data["cash_tx"],
+                      trades=data["trades"], connected=True)
     with divs:
         tab_dividends(data)
+    with perf:
+        tab_performance(data=data)
     with net_worth:
         tab_net_worth(data.get("cash_tx"))
         render_sync_details(report=data["sync"])

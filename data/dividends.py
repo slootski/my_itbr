@@ -832,7 +832,7 @@ def build_calendar(
     )
 
 
-# ---- buy markers ----------------------------------------------------------
+# ---- trade markers ----------------------------------------------------------
 
 def _num(*, value) -> float | None:
     if value is None or (isinstance(value, float) and pd.isna(value)):
@@ -869,26 +869,29 @@ def _holding_after(
     return current - later
 
 
-def buy_marks(
+def trade_marks(
     *, trades: pd.DataFrame | None, symbols: list[str], columns: list[str],
     shares: dict[str, float],
 ) -> dict[str, dict[str, list[dict]]]:
-    """symbol -> {"YYYY-MM": [buy]} for the calendar's rows and month columns.
+    """symbol -> {"YYYY-MM": [trade]} for the calendar's rows and month columns.
 
-    Fills of the same symbol on the same day are one buy: quantities, cost and
-    commission are summed and the price is the quantity-weighted average. Each
-    buy carries ``pos`` (0..1), where its day falls within the month, so the
-    marker sits at that point of the cell's timeline, and ``holding`` — shares
-    held at the end of that day, counted back from ``shares`` (held now; a
-    ticker absent from it is held at 0).
+    Buys and sells are marked separately; ``side`` is "BUY" or "SELL". Fills of
+    the same symbol, side and day are one trade: quantities, amount, commission
+    and realized P&L are summed and the price is the quantity-weighted average.
+    ``amount`` is the cost of a buy or the proceeds of a sell (always positive).
+    Each trade carries ``pos`` (0..1), where its day falls within the month, so
+    the marker sits at that point of the cell's timeline, and ``holding`` —
+    shares held at the end of that day, counted back from ``shares`` (held now;
+    a ticker absent from it is held at 0).
     """
     out: dict[str, dict[str, list[dict]]] = {}
     if trades is None or trades.empty or "side" not in trades or "symbol" not in trades:
         return out
     wanted, colset = set(symbols), set(columns)
-    days: dict[tuple[str, dt.date], dict] = {}
+    days: dict[tuple[str, dt.date, str], dict] = {}
     for row in trades.to_dict("records"):
-        if str(row.get("side")).upper() != "BUY":
+        side = str(row.get("side")).upper()
+        if side not in ("BUY", "SELL"):
             continue
         sym = row.get("symbol")
         date = _to_date(row.get("trade_date")) or _to_date(row.get("datetime"))
@@ -899,31 +902,34 @@ def buy_marks(
             continue
         price = _num(value=row.get("price"))
         proceeds = _num(value=row.get("proceeds"))
-        buy = days.setdefault((str(sym), date), {
-            "date": date, "quantity": 0.0, "cost": 0.0, "commission": 0.0,
-            "currency": row.get("currency"), "fills": 0, "_value": 0.0,
+        trade = days.setdefault((str(sym), date, side), {
+            "side": side, "date": date, "quantity": 0.0, "amount": 0.0, "commission": 0.0,
+            "realized_pnl": None, "currency": row.get("currency"), "fills": 0, "_value": 0.0,
         })
         qty = abs(qty)
-        buy["quantity"] += qty
-        buy["fills"] += 1
+        trade["quantity"] += qty
+        trade["fills"] += 1
         if proceeds is not None:
-            buy["cost"] += abs(proceeds)
+            trade["amount"] += abs(proceeds)
         elif price is not None:
-            buy["cost"] += qty * price
+            trade["amount"] += qty * price
         if price is not None:
-            buy["_value"] += qty * price
+            trade["_value"] += qty * price
         commission = _num(value=row.get("commission"))
         if commission is not None:
-            buy["commission"] += abs(commission)
+            trade["commission"] += abs(commission)
+        pnl = _num(value=row.get("realized_pnl"))
+        if pnl is not None:
+            trade["realized_pnl"] = (trade["realized_pnl"] or 0.0) + pnl
 
-    for (sym, date), buy in sorted(days.items(), key=lambda item: item[0][1]):
-        value = buy.pop("_value")
-        buy["price"] = value / buy["quantity"] if value else None
+    for (sym, date, _side), trade in sorted(days.items(), key=lambda item: item[0][1]):
+        value = trade.pop("_value")
+        trade["price"] = value / trade["quantity"] if value else None
         last_day = _calendar.monthrange(date.year, date.month)[1]
-        buy["pos"] = (date.day - 0.5) / last_day
-        buy["holding"] = _holding_after(trades=trades, symbol=sym, date=date,
-                                        current=shares.get(sym, 0.0))
-        out.setdefault(sym, {}).setdefault(_ym(date), []).append(buy)
+        trade["pos"] = (date.day - 0.5) / last_day
+        trade["holding"] = _holding_after(trades=trades, symbol=sym, date=date,
+                                          current=shares.get(sym, 0.0))
+        out.setdefault(sym, {}).setdefault(_ym(date), []).append(trade)
     return out
 
 
@@ -968,4 +974,32 @@ def extend_back(*, cal: Calendar, first_ym: str) -> Calendar:
         declared_sum=cal.declared_sum, sold=cal.sold, held_count=cal.held_count,
         shares=cal.shares,
         totals=totals, paid_sum=cal.paid_sum, no_data=cal.no_data, projected=cal.projected,
+    )
+
+
+def drop_absent_sold(*, cal: Calendar, marks: dict[str, dict[str, list[dict]]]) -> Calendar:
+    """Remove sold tickers that were not part of the portfolio in the months shown.
+
+    A sold ticker keeps its row when the displayed months hold something of it:
+    a dividend cell, or a trade marker (``marks``, from ``trade_marks`` for the
+    same columns) — a ticker held into the period always has at least the sell
+    that closed it. One bought and sold before the first month shown has
+    neither, and its empty row only adds noise. Removes no money: a dropped row
+    has no cell in these months, so no total changes. Held tickers always stay.
+    """
+    if cal.empty:
+        return cal
+    absent = {
+        sym for sym in cal.sold
+        if not marks.get(sym) and not (cal.values.loc[sym] != "").any()
+    }
+    if not absent:
+        return cal
+    keep = [sym for sym in cal.values.index if sym not in absent]
+    return Calendar(
+        values=cal.values.loc[keep], status=cal.status.loc[keep], tooltips=cal.tooltips.loc[keep],
+        current_ym=cal.current_ym, ticker_totals=cal.ticker_totals.drop(labels=list(absent), errors="ignore"),
+        declared_sum=cal.declared_sum, sold=cal.sold - absent, held_count=cal.held_count,
+        shares=cal.shares,
+        totals=cal.totals, paid_sum=cal.paid_sum, no_data=cal.no_data, projected=cal.projected,
     )

@@ -6,20 +6,22 @@ The Flex Web Service is a two-step async protocol:
 2. ``GetStatement`` with token + reference code -> statement XML (polling while
    IBKR generates it).
 
-The ``ibflex`` library already implements both steps with polling/backoff, so we
-delegate to ``ibflex.client.download`` and only wrap it to surface clear errors
-and a friendly message for the common failure modes (bad token, expired token,
-query not found).
+We run both steps ourselves with ``ibflex``'s parsing helpers, and wrap them
+to surface clear errors and a friendly message for the common failure modes
+(bad token, expired token, query not found).
 
-ibflex only retries ``requests.exceptions.Timeout`` internally, so a transient
-DNS failure or dropped connection mid-poll aborts the whole download. We add an
-outer retry for those transport-level errors.
+IBKR serves the Flex Web Service from two hosts: ``gdcdyn`` (the default
+GetStatement host, and what IBKR usually hands back in ``Url``) and ``ndcdyn``
+(the newer host). Each HTTP call fails over to the other host on a transport
+error, so one host's DNS or network outage does not fail the download. An outer
+retry then covers the case where both hosts are unreachable.
 """
 from __future__ import annotations
 
 import datetime as dt
 import logging
 import time
+from urllib.parse import urlsplit, urlunsplit
 
 import requests
 from ibflex import client as flex_client
@@ -38,6 +40,13 @@ RETRY_BACKOFF_SECONDS = 2.0
 # case ibflex gives up on after exhausting its own inner retries.
 RETRYABLE = (requests.exceptions.ConnectionError, requests.exceptions.Timeout)
 
+# Hosts that serve the same Flex Web Service paths. A request that fails on one
+# with a RETRYABLE error is re-sent to the others, in this order.
+FLEX_HOSTS = ("gdcdyn.interactivebrokers.com", "ndcdyn.interactivebrokers.com")
+
+# Per-HTTP-request timeout; statements can be large, so leave room to stream.
+REQUEST_TIMEOUT_SECONDS = 30
+
 
 # IBKR Flex response codes that mean the credential itself is dead: the only
 # fix is a new token from Account Management. Kept here so the UI can branch on
@@ -50,7 +59,7 @@ TOKEN_ERROR_CODES = (TOKEN_EXPIRED, TOKEN_INVALID)
 # for good, which is why data/history.py archives it locally.
 MAX_WINDOW_DAYS = 365
 
-# GetStatement polls for an explicit-range request (ibflex's own download uses 5).
+# GetStatement polls per request/poll cycle.
 MAX_POLLS = 10
 
 
@@ -79,24 +88,52 @@ def _scrub(text: object, token: str) -> str:
         return "<unprintable error>"
 
 
-def _fetch_range(*, token: str, query_id: str, date_range: tuple[dt.date, dt.date]) -> bytes:
-    """Run the request/poll cycle for an explicit ``fd``/``td`` date range.
+def _host_candidates(url: str) -> list[str]:
+    """Return ``url`` first, then the same path on every other Flex host."""
+    parts = urlsplit(url)
+    return [url] + [
+        urlunsplit(parts._replace(netloc=host))
+        for host in FLEX_HOSTS if host != parts.netloc
+    ]
 
-    ``ibflex.client.download`` cannot pass extra SendRequest parameters, so this
-    mirrors it with ibflex's own building blocks. IBKR answers 1003 ("Statement is
-    not available") when ``td`` has no data yet (a weekend or today), so callers
-    must end the range on a date IBKR has already served.
+
+def _get_with_failover(*, url: str, params: dict[str, str], token: str) -> requests.Response:
+    """GET ``url``; on a transport error, re-send the request to the other Flex hosts.
+
+    Raises the last transport error when every host fails, so the outer retry in
+    ``download_statement`` can take over.
     """
-    from_date, to_date = date_range
-    response = requests.get(
-        flex_client.REQUEST_URL,
-        params={
-            "v": "3", "t": token, "q": query_id,
-            "fd": from_date.strftime("%Y%m%d"), "td": to_date.strftime("%Y%m%d"),
-        },
-        headers={"user-agent": "Java"},
-        timeout=30,
-    )
+    candidates = _host_candidates(url)
+    for index, candidate in enumerate(candidates):
+        try:
+            return requests.get(
+                candidate, params=params, headers={"user-agent": "Java"},
+                timeout=REQUEST_TIMEOUT_SECONDS,
+            )
+        except RETRYABLE as exc:
+            if index == len(candidates) - 1:
+                raise
+            logger.warning(
+                "Flex host %s unreachable (%s); trying %s",
+                urlsplit(candidate).netloc, _scrub(exc, token),
+                urlsplit(candidates[index + 1]).netloc,
+            )
+    raise AssertionError("unreachable: candidates is never empty")
+
+
+def _fetch(*, token: str, query_id: str, date_range: tuple[dt.date, dt.date] | None) -> bytes:
+    """One request/poll cycle: the query's own period, or ``date_range`` when given.
+
+    With ``date_range`` the request carries ``fd``/``td``. IBKR answers 1003
+    ("Statement is not available") when ``td`` has no data yet (a weekend or
+    today), so callers must end the range on a date IBKR has already served.
+    """
+    params = {"v": "3", "t": token, "q": query_id}
+    if date_range is not None:
+        from_date, to_date = date_range
+        params["fd"] = from_date.strftime("%Y%m%d")
+        params["td"] = to_date.strftime("%Y%m%d")
+    response = _get_with_failover(url=flex_client.REQUEST_URL, params=params, token=token)
     access = flex_client.parse_stmt_response(response)
     if isinstance(access, flex_client.StatementError):
         raise ResponseCodeError(access.ErrorCode, access.ErrorMessage)
@@ -104,8 +141,10 @@ def _fetch_range(*, token: str, query_id: str, date_range: tuple[dt.date, dt.dat
     delay: bool | int = 0
     for _ in range(MAX_POLLS):
         time.sleep(delay)
-        statement = flex_client.submit_request(
-            url=access.Url or flex_client.STMT_URL, token=token, query=access.ReferenceCode,
+        statement = _get_with_failover(
+            url=access.Url or flex_client.STMT_URL,
+            params={"v": "3", "t": token, "q": access.ReferenceCode},
+            token=token,
         )
         delay = flex_client.check_statement_response(statement)
         if delay is True:
@@ -113,13 +152,6 @@ def _fetch_range(*, token: str, query_id: str, date_range: tuple[dt.date, dt.dat
     raise flex_client.StatementGenerationTimeout(
         f"Statement not ready after {MAX_POLLS} polls"
     )
-
-
-def _fetch(*, token: str, query_id: str, date_range: tuple[dt.date, dt.date] | None) -> bytes:
-    """One request/poll cycle: the query's own period, or ``date_range`` when given."""
-    if date_range is None:
-        return flex_client.download(token, query_id)
-    return _fetch_range(token=token, query_id=query_id, date_range=date_range)
 
 
 def download_statement(
@@ -136,9 +168,8 @@ def download_statement(
     if not token or not query_id:
         raise FlexError("Flex token and query id are required (set them in .env).")
 
-    # Log the query id only — NEVER the token. Polling/backoff (SendRequest ->
-    # GetStatement retries) happens inside ibflex.client.download and is not
-    # separately observable here; we log the overall outcome and duration.
+    # Log the query id only — NEVER the token. We log the overall outcome and
+    # duration; host failovers log their own warning.
     logger.info(
         "download_statement start (query_id=%s, range=%s)",
         query_id, "query period" if date_range is None

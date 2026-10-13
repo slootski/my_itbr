@@ -146,6 +146,9 @@ def candlestick(
     mean_close: float | None = None,
     trades: pd.DataFrame | None = None,
     show_volume: bool = True,
+    *,
+    buy_target: float | None,
+    sell_target: float | None,
 ) -> go.Figure:
     """Candlestick + volume subplot from a yfinance OHLC frame.
 
@@ -158,6 +161,7 @@ def candlestick(
                       than the data is skipped rather than drawn as a gap.
       ``mean_close``  dashed line at the period's mean close.
       ``trades``      buy/sell markers from the Flex trades frame.
+      ``buy_target`` / ``sell_target``  dashed lines at my watchlist targets.
     """
     if ohlc.empty:
         return _empty(f"No price data for {symbol}" if symbol else "No price data")
@@ -190,6 +194,15 @@ def candlestick(
         fig.add_hline(y=avg_cost, line=dict(color="#e8c33c", width=1.5, dash="dash"),
                       annotation_text=f"My cost {avg_cost:,.2f}",
                       annotation_position="bottom left", row=1, col=1)
+
+    if buy_target is not None:
+        fig.add_hline(y=buy_target, line=dict(color=_PRICE_UP, width=1.5, dash="dash"),
+                      annotation_text=f"Buy {buy_target:,.2f}",
+                      annotation_position="bottom right", row=1, col=1)
+    if sell_target is not None:
+        fig.add_hline(y=sell_target, line=dict(color=_PRICE_DOWN, width=1.5, dash="dash"),
+                      annotation_text=f"Sell {sell_target:,.2f}",
+                      annotation_position="top right", row=1, col=1)
 
     _trade_markers(fig, trades, ohlc)
 
@@ -583,4 +596,42 @@ def nav_composition_area(
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, xanchor="left"),
         hovermode="x unified",
     )
+    return fig
+
+
+# Share of the value range kept free beyond the longest bar for its label.
+_DAY_BAR_LABEL_PAD = 0.28
+
+
+def day_symbols_bar(*, rows: list[dict], currency: str | None) -> go.Figure:
+    """One day's P&L per ticker as horizontal bars, biggest gain on top.
+
+    ``rows`` are ``performance.day_symbols`` items (``symbol``, ``pnl``, ``pct``).
+    Direction is on the axis (right of zero is a gain) and in the label's sign,
+    not only in the bar colour.
+    """
+    if not rows:
+        return _empty("No per-ticker data for this day")
+    ordered = sorted(rows, key=lambda row: row["pnl"])
+    unit = f" {currency}" if currency else ""
+    labels = [
+        f"{row['pnl']:+,.2f}" + ("" if row["pct"] is None else f"  ({row['pct'] * 100:+.2f}%)")
+        for row in ordered
+    ]
+    fig = go.Figure(go.Bar(
+        x=[row["pnl"] for row in ordered], y=[row["symbol"] for row in ordered], orientation="h",
+        marker_color=[_PRICE_UP if row["pnl"] >= 0 else _PRICE_DOWN for row in ordered],
+        text=labels, textposition="outside", cliponaxis=False,
+        hovertemplate="%{y}: %{x:+,.2f}" + unit + "<extra></extra>",
+    ))
+    fig.update_layout(
+        margin=dict(l=10, r=90, t=10, b=10), height=max(160, 26 * len(ordered) + 60),
+        xaxis_title=f"P&L{' (' + currency + ')' if currency else ''}", bargap=0.35,
+    )
+    # Value labels sit outside the bars; widen the axis on both sides so the
+    # longest bar's label has room and never runs into the ticker names.
+    low, high = min(0.0, ordered[0]["pnl"]), max(0.0, ordered[-1]["pnl"])
+    pad = (high - low) * _DAY_BAR_LABEL_PAD or 1.0
+    fig.update_xaxes(zeroline=True, zerolinewidth=1,
+                     range=[low - pad if low < 0 else 0.0, high + pad if high > 0 else 0.0])
     return fig

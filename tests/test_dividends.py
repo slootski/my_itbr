@@ -797,7 +797,7 @@ def test_external_empty_info_keeps_no_data_row():
     assert "ZZZ" in cal.no_data
 
 
-# ---- buy markers ------------------------------------------------------------
+# ---- trade markers ------------------------------------------------------------
 
 def _trades(rows):
     return pd.DataFrame([
@@ -808,38 +808,70 @@ def _trades(rows):
     ])
 
 
-def test_buy_marks_one_per_buy_day_in_its_month():
+def test_trade_marks_one_per_buy_day_in_its_month():
     trades = _trades([
         ("ABC", dt.date(2020, 1, 1), "BUY", 1.0, 10.0),
         ("ABC", dt.date(2020, 2, 2), "BUY", 1.0, 20.0),
-        ("ABC", dt.date(2020, 2, 20), "SELL", 1.0, 25.0),   # sells are not marked
+        ("ABC", dt.date(2020, 2, 20), "SELL", -1.0, 25.0),
         ("XYZ", dt.date(2020, 1, 5), "BUY", 1.0, 5.0),      # not a calendar row
     ])
-    marks = dividends.buy_marks(trades=trades, symbols=["ABC"],
-                                columns=["2020-01", "2020-02"], shares={"ABC": 1.0})
+    marks = dividends.trade_marks(trades=trades, symbols=["ABC"],
+                                  columns=["2020-01", "2020-02"], shares={"ABC": 1.0})
     assert set(marks) == {"ABC"}
     jan, feb = marks["ABC"]["2020-01"], marks["ABC"]["2020-02"]
-    assert [(b["date"], b["price"], b["cost"]) for b in jan] == [(dt.date(2020, 1, 1), 10.0, 10.0)]
-    assert [(b["date"], b["price"]) for b in feb] == [(dt.date(2020, 2, 2), 20.0)]
+    assert [(b["side"], b["date"], b["price"], b["amount"]) for b in jan] == [
+        ("BUY", dt.date(2020, 1, 1), 10.0, 10.0)]
+    assert [(b["side"], b["date"], b["price"]) for b in feb] == [
+        ("BUY", dt.date(2020, 2, 2), 20.0), ("SELL", dt.date(2020, 2, 20), 25.0)]
     assert 0 < jan[0]["pos"] < feb[0]["pos"] < 1  # day 1 sits left of day 2 of 29
 
 
-def test_buy_marks_merge_same_day_fills_with_average_price():
+def test_trade_marks_merge_same_day_fills_with_average_price():
     trades = _trades([
         ("ABC", dt.date(2020, 1, 10), "BUY", 2.0, 10.0),
         ("ABC", dt.date(2020, 1, 10), "BUY", 2.0, 12.0),
     ])
-    (buy,) = dividends.buy_marks(trades=trades, symbols=["ABC"], columns=["2020-01"],
+    (buy,) = dividends.trade_marks(trades=trades, symbols=["ABC"], columns=["2020-01"],
                                   shares={"ABC": 4.0})["ABC"]["2020-01"]
-    assert (buy["quantity"], buy["price"], buy["cost"], buy["commission"], buy["fills"]) == (
+    assert (buy["quantity"], buy["price"], buy["amount"], buy["commission"], buy["fills"]) == (
         4.0, 11.0, 44.0, 2.0, 2)
 
 
-def test_buy_marks_skip_months_outside_the_window():
+def test_trade_marks_skip_months_outside_the_window():
     trades = _trades([("ABC", dt.date(2019, 12, 31), "BUY", 1.0, 10.0)])
-    assert dividends.buy_marks(trades=trades, symbols=["ABC"], columns=["2020-01"],
+    assert dividends.trade_marks(trades=trades, symbols=["ABC"], columns=["2020-01"],
                                shares={"ABC": 1.0}) == {}
 
+
+
+def test_trade_marks_keep_same_day_buy_and_sell_apart():
+    trades = _trades([
+        ("ABC", dt.date(2020, 1, 10), "BUY", 2.0, 10.0),
+        ("ABC", dt.date(2020, 1, 10), "SELL", -1.0, 12.0),
+    ])
+    marks = dividends.trade_marks(trades=trades, symbols=["ABC"], columns=["2020-01"],
+                                  shares={"ABC": 1.0})["ABC"]["2020-01"]
+    assert sorted((m["side"], m["quantity"], m["amount"]) for m in marks) == [
+        ("BUY", 2.0, 20.0), ("SELL", 1.0, 12.0)]
+
+
+def test_trade_marks_sum_realized_pnl_of_sell_fills():
+    trades = _trades([
+        ("ABC", dt.date(2020, 1, 10), "SELL", -1.0, 12.0),
+        ("ABC", dt.date(2020, 1, 10), "SELL", -1.0, 14.0),
+    ]).assign(realized_pnl=[2.0, 4.0])
+    (sell,) = dividends.trade_marks(trades=trades, symbols=["ABC"], columns=["2020-01"],
+                                    shares={"ABC": 0.0})["ABC"]["2020-01"]
+    assert (sell["side"], sell["quantity"], sell["price"], sell["realized_pnl"], sell["fills"]) == (
+        "SELL", 2.0, 13.0, 6.0, 2)
+    assert sell["holding"] == 0.0
+
+
+def test_trade_marks_without_realized_pnl_column_leave_it_none():
+    trades = _trades([("ABC", dt.date(2020, 1, 10), "SELL", -1.0, 12.0)])
+    (sell,) = dividends.trade_marks(trades=trades, symbols=["ABC"], columns=["2020-01"],
+                                    shares={"ABC": 0.0})["ABC"]["2020-01"]
+    assert sell["realized_pnl"] is None
 
 def test_extend_back_adds_empty_months_and_keeps_totals():
     cal = dividends.build_calendar(_positions("ABC"), _quarterly_cash_tx(), pd.DataFrame(),
@@ -862,25 +894,25 @@ def test_first_buy_month_ignores_sells_and_other_symbols():
     assert dividends.first_buy_month(trades=trades, symbols=["ABC"]) == "2020-03"
 
 
-def test_buy_marks_holding_after_each_buy_counts_back_from_today():
+def test_trade_marks_holding_after_each_buy_counts_back_from_today():
     # Held 1 share today: bought 1 (Jan), bought 1 (Feb 2), sold 1 (Feb 20).
     trades = _trades([
         ("ABC", dt.date(2020, 1, 1), "BUY", 1.0, 10.0),
         ("ABC", dt.date(2020, 2, 2), "BUY", 1.0, 20.0),
         ("ABC", dt.date(2020, 2, 20), "SELL", -1.0, 25.0),
     ])
-    marks = dividends.buy_marks(trades=trades, symbols=["ABC"],
+    marks = dividends.trade_marks(trades=trades, symbols=["ABC"],
                                 columns=["2020-01", "2020-02"], shares={"ABC": 1.0})
     assert marks["ABC"]["2020-01"][0]["holding"] == 1.0
     assert marks["ABC"]["2020-02"][0]["holding"] == 2.0
 
 
-def test_buy_marks_sold_ticker_counts_back_from_zero():
+def test_trade_marks_sold_ticker_counts_back_from_zero():
     trades = _trades([
         ("GONE", dt.date(2020, 1, 1), "BUY", 3.0, 10.0),
         ("GONE", dt.date(2020, 3, 1), "SELL", -3.0, 12.0),
     ])
-    marks = dividends.buy_marks(trades=trades, symbols=["GONE"], columns=["2020-01"], shares={})
+    marks = dividends.trade_marks(trades=trades, symbols=["GONE"], columns=["2020-01"], shares={})
     assert marks["GONE"]["2020-01"][0]["holding"] == 3.0
 
 
@@ -896,3 +928,39 @@ def test_calendar_carries_current_shares():
     cal = dividends.build_calendar(positions, _quarterly_cash_tx(), pd.DataFrame(),
                                    today=dt.date(2026, 4, 1))
     assert cal.shares == {"ABC": 12.3456}
+
+
+# ---- sold tickers outside the shown months -----------------------------------
+
+def _sold_calendar() -> dividends.Calendar:
+    index, columns = ["HELD", "GONE", "PAID", "TRADED"], ["2026-05", "2026-06"]
+    blank = pd.DataFrame("", index=index, columns=columns)
+    values = blank.copy()
+    values.loc["PAID", "2026-06"] = "1.50"
+    return dividends.Calendar(
+        values=values, status=blank.copy(), tooltips=blank.copy(), current_ym="2026-06",
+        ticker_totals=pd.Series({"HELD": "", "GONE": "", "PAID": "1.50", "TRADED": ""}),
+        declared_sum=0.0, sold={"GONE", "PAID", "TRADED"}, held_count=1, shares={"HELD": 3.0},
+        totals=pd.Series({"2026-05": "", "2026-06": "1.50"}), paid_sum=1.5,
+        no_data={"HELD"}, projected=set(),
+    )
+
+
+def test_sold_ticker_with_nothing_in_the_shown_months_is_dropped():
+    """Sold before the first month shown: it was not in the portfolio then."""
+    marks = {"TRADED": {"2026-05": [{"side": "SELL"}]}}
+    out = dividends.drop_absent_sold(cal=_sold_calendar(), marks=marks)
+    # A held ticker stays even with an empty row; a sold one needs a dividend
+    # or a trade inside the months shown.
+    assert list(out.values.index) == ["HELD", "PAID", "TRADED"]
+    assert list(out.status.index) == list(out.tooltips.index) == ["HELD", "PAID", "TRADED"]
+    assert out.sold == {"PAID", "TRADED"}
+    assert "GONE" not in out.ticker_totals
+    # No money moved: the dropped row had no cell.
+    assert out.paid_sum == 1.5 and out.totals["2026-06"] == "1.50" and out.held_count == 1
+
+
+def test_drop_absent_sold_returns_the_same_calendar_when_nothing_to_drop():
+    cal = _sold_calendar()
+    marks = {"GONE": {"2026-05": [{"side": "BUY"}]}, "TRADED": {"2026-05": [{"side": "SELL"}]}}
+    assert dividends.drop_absent_sold(cal=cal, marks=marks) is cal

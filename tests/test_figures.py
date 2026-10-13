@@ -69,8 +69,8 @@ def test_cumulative_pnl_line(trades):
 
 
 def test_candlestick(ohlc):
-    assert isinstance(figures.candlestick(EMPTY, "AAPL"), go.Figure)
-    assert isinstance(figures.candlestick(ohlc, "AAPL"), go.Figure)
+    assert isinstance(figures.candlestick(EMPTY, "AAPL", buy_target=None, sell_target=None), go.Figure)
+    assert isinstance(figures.candlestick(ohlc, "AAPL", buy_target=None, sell_target=None), go.Figure)
 
 
 @pytest.fixture
@@ -106,20 +106,20 @@ def _trace_names(fig):
 
 
 def test_candlestick_ma_overlay_skips_windows_longer_than_data(long_ohlc):
-    fig = figures.candlestick(long_ohlc, "AAPL", ma_windows=(20, 50))
+    fig = figures.candlestick(long_ohlc, "AAPL", ma_windows=(20, 50), buy_target=None, sell_target=None)
     names = _trace_names(fig)
     assert "MA20" in names
     assert "MA50" not in names  # only 30 bars
 
 
 def test_candlestick_hlines_for_cost_and_mean(long_ohlc):
-    fig = figures.candlestick(long_ohlc, "AAPL", avg_cost=15.0, mean_close=24.5)
+    fig = figures.candlestick(long_ohlc, "AAPL", avg_cost=15.0, mean_close=24.5, buy_target=None, sell_target=None)
     ys = {shape.y0 for shape in fig.layout.shapes}
     assert {15.0, 24.5} <= ys
 
 
 def test_candlestick_trade_markers_clipped_to_window(long_ohlc, price_trades):
-    fig = figures.candlestick(long_ohlc, "AAPL", trades=price_trades)
+    fig = figures.candlestick(long_ohlc, "AAPL", trades=price_trades, buy_target=None, sell_target=None)
     by_name = {t.name: t for t in fig.data if t.name in ("Buy", "Sell")}
     assert set(by_name) == {"Buy", "Sell"}
     # The 2030 buy falls outside the 30-day window, so only one buy survives.
@@ -128,7 +128,7 @@ def test_candlestick_trade_markers_clipped_to_window(long_ohlc, price_trades):
 
 
 def test_candlestick_no_overlays_matches_bare_chart(long_ohlc):
-    fig = figures.candlestick(long_ohlc, "AAPL")
+    fig = figures.candlestick(long_ohlc, "AAPL", buy_target=None, sell_target=None)
     assert len(fig.data) == 2  # candles + volume only
     assert not fig.layout.shapes
 
@@ -138,14 +138,14 @@ def test_candlestick_skips_non_trading_days():
     dates = pd.to_datetime(["2024-01-12", "2024-01-16", "2024-01-17"]).tz_localize("America/New_York")
     ohlc = pd.DataFrame({"date": dates, "open": [1.0] * 3, "high": [2.0] * 3,
                          "low": [0.5] * 3, "close": [1.5] * 3, "volume": [100] * 3})
-    fig = figures.candlestick(ohlc, "AAPL")
+    fig = figures.candlestick(ohlc, "AAPL", buy_target=None, sell_target=None)
     expected = ["2024-01-13", "2024-01-14", "2024-01-15"]
     assert list(fig.layout.xaxis.rangebreaks[0].values) == expected
     assert list(fig.layout.xaxis2.rangebreaks[0].values) == expected
 
 
 def test_candlestick_hides_volume_row(long_ohlc):
-    fig = figures.candlestick(long_ohlc, "AAPL", show_volume=False)
+    fig = figures.candlestick(long_ohlc, "AAPL", show_volume=False, buy_target=None, sell_target=None)
     assert len(fig.data) == 1
 
 
@@ -153,12 +153,12 @@ def test_candlestick_trade_markers_tolerate_tz_aware_prices(long_ohlc, price_tra
     """yfinance returns tz-aware dates; Flex trade dates are naive."""
     tz_ohlc = long_ohlc.copy()
     tz_ohlc["date"] = tz_ohlc["date"].dt.tz_localize("America/New_York")
-    fig = figures.candlestick(tz_ohlc, "AAPL", trades=price_trades)
+    fig = figures.candlestick(tz_ohlc, "AAPL", trades=price_trades, buy_target=None, sell_target=None)
     assert isinstance(fig, go.Figure)
 
 
 def test_candlestick_empty_trades_frame(long_ohlc):
-    assert isinstance(figures.candlestick(long_ohlc, "AAPL", trades=EMPTY), go.Figure)
+    assert isinstance(figures.candlestick(long_ohlc, "AAPL", trades=EMPTY, buy_target=None, sell_target=None), go.Figure)
 
 
 def test_nav_line(history):
@@ -382,3 +382,38 @@ def test_nav_composition_area_skips_the_band_when_no_income(composition):
     comp["dividends"] = [0.0, 0.0, 0.0]
     fig = figures.nav_composition_area(comp, "USD", show_dividends=True)
     assert [t.name for t in fig.data] == ["Contributed", "Net liquidation"]
+
+
+def test_day_symbols_bar_orders_bars_and_labels_sign():
+    rows = [{"symbol": "AAPL", "pnl": 50.0, "pct": 0.0345}, {"symbol": "MSFT", "pnl": -4.0, "pct": -0.01},
+            {"symbol": "NEW", "pnl": 0.0, "pct": None}]
+    bar = figures.day_symbols_bar(rows=rows, currency="USD").data[0]
+    assert bar.orientation == "h"
+    # Plotly draws the first item at the bottom, so the biggest gain ends on top.
+    assert list(bar.y) == ["MSFT", "NEW", "AAPL"]
+    assert list(bar.text) == ["-4.00  (-1.00%)", "+0.00", "+50.00  (+3.45%)"]
+    assert bar.marker.color[0] != bar.marker.color[2]
+
+
+def test_day_symbols_bar_empty():
+    fig = figures.day_symbols_bar(rows=[], currency="USD")
+    assert "No per-ticker data" in fig.layout.annotations[0].text
+
+
+def test_day_symbols_bar_leaves_room_for_labels_on_both_sides():
+    rows = [{"symbol": "A", "pnl": 10.0, "pct": 0.01}, {"symbol": "B", "pnl": -5.0, "pct": -0.01}]
+    low, high = figures.day_symbols_bar(rows=rows, currency="USD").layout.xaxis.range
+    assert low < -5.0 and high > 10.0
+    # All gains: the axis still starts at zero, with no empty negative side.
+    low, high = figures.day_symbols_bar(rows=rows[:1], currency="USD").layout.xaxis.range
+    assert low == 0.0 and high > 10.0
+
+
+@pytest.mark.parametrize(("buy", "sell", "texts"), [
+    (None, None, []), (150.0, None, ["Buy 150.00"]), (None, 175.0, ["Sell 175.00"]),
+    (150.0, 175.0, ["Buy 150.00", "Sell 175.00"]),
+])
+def test_candlestick_target_lines(ohlc, buy, sell, texts):
+    fig = figures.candlestick(ohlc, "AAPL", buy_target=buy, sell_target=sell)
+    assert [a.text for a in fig.layout.annotations] == texts
+    assert len(fig.layout.shapes) == len(texts)

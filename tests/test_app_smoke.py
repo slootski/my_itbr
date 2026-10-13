@@ -7,11 +7,12 @@ Boundaries are monkeypatched so the run is fully offline and side-effect free:
 - ``FLEX_TOKEN`` / ``FLEX_QUERY_ID`` env vars make ``settings.is_configured``
   true, and ``DB_PATH`` points the snapshot DB at a pytest tmp path.
 
-The test asserts the app runs without exceptions and renders all 6 tabs.
+The test asserts the app runs without exceptions and renders all 8 tabs.
 """
 from __future__ import annotations
 
 import datetime as dt
+import re
 from pathlib import Path
 
 import pandas as pd
@@ -23,7 +24,8 @@ from tests.conftest import SYNTHETIC_FLEX_XML
 
 APP_PATH = Path(__file__).resolve().parents[1] / "app.py"
 
-EXPECTED_TABS = ["Overview", "Positions", "Trades", "Prices", "Dividends", "Net Worth"]
+EXPECTED_TABS = ["Overview", "Positions", "Trades", "Prices", "Watchlist", "Dividends", "Performance",
+                 "Net Worth"]
 
 _FAKE_OHLC = pd.DataFrame(
     {
@@ -78,7 +80,7 @@ def smoke_app(monkeypatch, tmp_path):
     st.cache_data.clear()
 
 
-def test_app_runs_without_exception_and_renders_all_six_tabs(smoke_app):
+def test_app_runs_without_exception_and_renders_all_eight_tabs(smoke_app):
     at, ctx = smoke_app
     at.run()
 
@@ -86,7 +88,7 @@ def test_app_runs_without_exception_and_renders_all_six_tabs(smoke_app):
     assert not at.exception, f"app raised: {[e.value for e in at.exception]}"
     assert not at.error, f"app showed st.error: {[e.value for e in at.error]}"
 
-    # All 6 tabs present, in spec order.
+    # All 8 tabs present, in spec order.
     assert [tab.label for tab in at.tabs] == EXPECTED_TABS
 
     # The pipeline really ran against the patched boundaries (offline).
@@ -645,3 +647,350 @@ def test_each_new_session_pulls_again(monkeypatch, tmp_path):
         assert len(calls) == 2
     finally:
         st.cache_data.clear()
+
+
+# ---- Performance tab ---------------------------------------------------------
+
+# Three months of closes (Oct..Dec 2024) for the period controls; the stock
+# statement has two closes in one month, which leaves nothing to choose between.
+_THREE_MONTH_EQUITY = b"""<EquitySummaryInBase>
+<EquitySummaryByReportDateInBase reportDate="2024-10-30" cash="500" stock="9000" total="9500"/>
+<EquitySummaryByReportDateInBase reportDate="2024-10-31" cash="500" stock="9100" total="9600"/>
+<EquitySummaryByReportDateInBase reportDate="2024-11-29" cash="500" stock="9300" total="9800"/>
+<EquitySummaryByReportDateInBase reportDate="2024-12-30" cash="500" stock="9500" total="10000"/>
+<EquitySummaryByReportDateInBase reportDate="2024-12-31" cash="600" stock="9900" total="10500"/>
+</EquitySummaryInBase>"""
+
+
+@pytest.fixture
+def three_month_app(smoke_app, monkeypatch):
+    from ibkr import flex
+
+    head, rest = SYNTHETIC_FLEX_XML.split(b"<EquitySummaryInBase>")
+    xml = head + _THREE_MONTH_EQUITY + rest.split(b"</EquitySummaryInBase>")[1]
+    monkeypatch.setattr(flex, "download_statement", lambda token, query_id, date_range: xml)
+    at, _ = smoke_app
+    at.run()
+    assert not at.exception, f"app raised: {[e.value for e in at.exception]}"
+    return at
+
+
+def _period(at):
+    """The period slider. Found by label: its key changes each time a button
+    or a month row sets the period (see app._set_perf_period)."""
+    return next(s for s in at.select_slider if s.label == "Period")
+
+
+def _metrics(at) -> dict:
+    return {m.label: m.value for m in at.metric}
+
+
+def test_performance_tab_with_one_month_shows_it_without_period_controls(smoke_app):
+    """The synthetic statement has two closes (30 and 31 Dec 2024): 10000 -> 10500
+    with no deposit in between, a +5.00% day worth +500.00."""
+    at, _ = smoke_app
+    at.run()
+    assert not at.exception, f"app raised: {[e.value for e in at.exception]}"
+
+    assert not [s for s in at.select_slider if s.label == "Period"]
+    metrics = _metrics(at)
+    assert metrics["Return"] == "+5.00%"
+    assert metrics["P&L (USD)"] == "+500.00"
+    assert metrics["Best day"] == "+5.00%"
+    assert metrics["Up days"] == "1 / 1"
+    # The statement's one trade (1 Jun 2024, commission 1.00) is outside December.
+    assert metrics["Fees (USD)"] == "0.00"
+
+
+def test_performance_period_starts_on_everything(three_month_app):
+    """A new session opens on All: every month, one row each, All marked. 3M is
+    the same three months here and comes first, so the mark must be set, not matched."""
+    at = three_month_app
+    period = _period(at)
+    assert list(period.options) == ["October 2024", "November 2024", "December 2024"]
+    assert period.value == ("2024-10", "2024-12")
+    assert at.button_group(key="perf_preset").value == "All"
+    assert _metrics(at)["Return"] == "+10.53%"
+    assert [b.key for b in at.button if str(b.key).startswith("perf_open_")] == [
+        "perf_open_2024_10", "perf_open_2024_11", "perf_open_2024_12"]
+    # Both ends are reached: neither arrow can move the period.
+    assert at.button(key="perf_newer").disabled and at.button(key="perf_older").disabled
+
+
+def test_performance_single_month_period_shows_its_days(three_month_app):
+    at = three_month_app
+    _period(at).set_range("2024-12", "2024-12").run()
+    assert not at.exception, f"app raised: {[e.value for e in at.exception]}"
+    # December is measured from November's last close: 9800 -> 10500.
+    assert _metrics(at)["Return"] == "+7.14%"
+    assert not [b for b in at.button if str(b.key).startswith("perf_open_")]   # one month: its days
+
+
+def test_performance_period_slider_selects_several_months(three_month_app):
+    at = three_month_app
+    _period(at).set_range("2024-10", "2024-12").run()
+    assert not at.exception, f"app raised: {[e.value for e in at.exception]}"
+    # 9500 -> 10500 over the period, no deposits in it.
+    metrics = _metrics(at)
+    assert metrics["Return"] == "+10.53%"
+    assert metrics["P&L (USD)"] == "+1,000.00"
+    assert metrics["Up days"] == "4 / 4"
+    # Several months: one clickable row each.
+    assert [b.key for b in at.button if str(b.key).startswith("perf_open_")] == [
+        "perf_open_2024_10", "perf_open_2024_11", "perf_open_2024_12"]
+
+
+def test_clicking_a_month_row_opens_that_month(three_month_app):
+    at = three_month_app
+    _period(at).set_range("2024-10", "2024-12").run()
+    at.button(key="perf_open_2024_11").click().run()
+    assert not at.exception, f"app raised: {[e.value for e in at.exception]}"
+    assert _period(at).value == ("2024-11", "2024-11")
+    assert _metrics(at)["P&L (USD)"] == "+200.00"
+
+
+def test_arrows_move_the_period_and_stop_at_the_ends(three_month_app):
+    at = three_month_app
+    _period(at).set_range("2024-12", "2024-12").run()
+    assert at.button(key="perf_newer").disabled and not at.button(key="perf_older").disabled
+    at.button(key="perf_older").click().run()
+    assert _period(at).value == ("2024-11", "2024-11")
+    at.button(key="perf_older").click().run()
+    assert _period(at).value == ("2024-10", "2024-10")
+    assert at.button(key="perf_older").disabled
+
+
+def test_quick_period_sets_the_slider_and_stays_selected(three_month_app):
+    at = three_month_app
+    assert at.button_group(key="perf_preset").value == "All"       # the starting period
+    at.button_group(key="perf_preset").set_value("1M").run()
+    assert not at.exception, f"app raised: {[e.value for e in at.exception]}"
+    assert _period(at).value == ("2024-12", "2024-12")
+    assert at.button_group(key="perf_preset").value == "1M"
+    at.button_group(key="perf_preset").set_value("All").run()
+    assert _period(at).value == ("2024-10", "2024-12")
+    assert at.button_group(key="perf_preset").value == "All"
+
+
+def test_quick_period_mark_follows_the_period_whoever_set_it(three_month_app):
+    at = three_month_app
+    at.button_group(key="perf_preset").set_value("All").run()
+    # A custom period: no quick period is marked.
+    _period(at).set_range("2024-10", "2024-11").run()
+    assert at.button_group(key="perf_preset").value is None
+    # Dragged back to the newest month: 1M again, though nobody clicked it.
+    _period(at).set_range("2024-12", "2024-12").run()
+    assert at.button_group(key="perf_preset").value == "1M"
+    # A month row that is not the newest month: custom again.
+    at.button_group(key="perf_preset").set_value("All").run()
+    at.button(key="perf_open_2024_10").click().run()
+    assert at.button_group(key="perf_preset").value is None
+
+
+def test_clicking_the_selected_quick_period_keeps_it_selected(three_month_app):
+    at = three_month_app
+    at.button_group(key="perf_preset").set_value("All").run()
+    at.button_group(key="perf_preset").set_value(None).run()      # a second click deselects
+    assert _period(at).value == ("2024-10", "2024-12")
+    assert at.button_group(key="perf_preset").value == "All"
+
+
+def test_matching_preset_prefers_the_one_the_user_picked():
+    import app
+
+    options = ["2026-01", "2026-02", "2026-03"]
+    everything = ("2026-01", "2026-03")
+    # 3M, 6M, 1Y, YTD and All are all the same three months here.
+    assert app._matching_preset(options=options, period=everything, picked=None) == "3M"
+    assert app._matching_preset(options=options, period=everything, picked="YTD") == "YTD"
+    assert app._matching_preset(options=options, period=everything, picked="1M") == "3M"
+    assert app._matching_preset(options=options, period=("2026-01", "2026-02"), picked="YTD") is None
+
+
+def test_year_fees_count_trades_on_days_without_a_close(three_month_app):
+    """The June trade's 1.00 commission is outside Oct..Dec, so it is not in the period."""
+    at = three_month_app
+    _period(at).set_range("2024-10", "2024-12").run()
+    assert _metrics(at)["Fees (USD)"] == "0.00"
+
+
+def test_performance_closes_are_stored_for_later(smoke_app):
+    """The statement's closes land in equity_daily, so days that age out of the
+    Flex window keep their true value."""
+    from data import snapshots
+
+    at, ctx = smoke_app
+    at.run()
+    stored = snapshots.read_equity_daily(db_path=ctx["db_path"])
+    assert [d.isoformat() for d in stored["report_date"]] == ["2024-12-30", "2024-12-31"]
+
+
+def test_preset_periods_end_on_the_newest_month():
+    import app
+
+    options = app._month_options(months=[(2025, 11), (2026, 1), (2026, 3)])
+    assert options == ["2025-11", "2025-12", "2026-01", "2026-02", "2026-03"]   # no holes
+    assert app._preset_period(options=options, preset="1M") == ("2026-03", "2026-03")
+    assert app._preset_period(options=options, preset="3M") == ("2026-01", "2026-03")
+    assert app._preset_period(options=options, preset="1Y") == ("2025-11", "2026-03")   # clamped
+    assert app._preset_period(options=options, preset="YTD") == ("2026-01", "2026-03")
+    assert app._preset_period(options=options, preset="All") == ("2025-11", "2026-03")
+
+
+def test_shifting_a_period_keeps_its_length():
+    import app
+
+    options = ["2025-11", "2025-12", "2026-01", "2026-02", "2026-03"]
+    st.session_state[app._PERF_PERIOD_KEY] = ("2025-12", "2026-01")
+    try:
+        app._shift_perf_period(options=options, step=1)
+        assert st.session_state[app._PERF_PERIOD_KEY] == ("2026-01", "2026-02")
+        app._shift_perf_period(options=options, step=5)   # clamped at the newest month
+        assert st.session_state[app._PERF_PERIOD_KEY] == ("2026-02", "2026-03")
+        app._shift_perf_period(options=options, step=-9)  # clamped at the oldest month
+        assert st.session_state[app._PERF_PERIOD_KEY] == ("2025-11", "2025-12")
+    finally:
+        del st.session_state[app._PERF_PERIOD_KEY]
+        del st.session_state[app._PERF_SLIDER_SEQ_KEY]
+
+
+def test_clicking_a_day_opens_its_details(smoke_app):
+    """31 Dec 2024: AAPL +50 (+3.45%), MSFT -4 (-1.00%) on a +500.00 day."""
+    at, _ = smoke_app
+    at.run()
+    assert "Close" not in _metrics(at)                     # no dialog until a day is clicked
+    # The first close on record (30 Dec) opens too; it has a close, just no change.
+    assert [b.key for b in at.button if str(b.key).startswith("perf_dayopen_")] == [
+        "perf_dayopen_2024_12_30", "perf_dayopen_2024_12_31"]
+
+    at.button(key="perf_dayopen_2024_12_31").click().run()
+    assert not at.exception, f"app raised: {[e.value for e in at.exception]}"
+    metrics = _metrics(at)
+    assert metrics["Close"] == "10,500.00" and metrics["Previous close"] == "10,000.00"
+    assert any("Tuesday, 31 December 2024" in h.value for h in at.subheader)
+    tables = [df.value for df in at.dataframe]
+    tickers = next(t for t in tables if "Ticker" in t and "Price change %" in t)
+    assert list(tickers["Ticker"]) == ["AAPL", "MSFT"]      # biggest gain first
+    assert list(tickers["P&L"]) == [50.0, -4.0]
+    assert list(tickers["Price change %"]) == [3.45, -1.0]
+    bridge = next(t for t in tables if "Source" in t)
+    assert list(bridge["Amount"]) == [46.0, 454.0, 500.0]   # held + everything else = day total
+
+
+def test_per_ticker_days_are_stored_for_later(smoke_app):
+    from data import snapshots
+
+    at, ctx = smoke_app
+    at.run()
+    assert len(snapshots.read_symbol_daily(db_path=ctx["db_path"])) == 4
+
+
+def test_period_changes_rebuild_the_slider_instead_of_writing_to_it(three_month_app):
+    """Buttons and month rows must not set the slider's own key: Streamlit logs a
+    warning whenever a widget that has a default value is also set through
+    session state. (That warning needs a running server, so it cannot be caught
+    here; the fresh key per change is what prevents it.)"""
+    at = three_month_app
+    assert _period(at).key == "perf_period_slider_0"
+    at.button(key="perf_open_2024_12").click().run()                 # a month row
+    at.button(key="perf_older").click().run()                        # an arrow
+    at.button_group(key="perf_preset").set_value("All").run()        # a quick period
+    at.button(key="perf_open_2024_11").click().run()
+    assert not at.exception, f"app raised: {[e.value for e in at.exception]}"
+    assert _period(at).key == "perf_period_slider_4"
+    assert _period(at).value == ("2024-11", "2024-11")
+    # Dragging by hand keeps the same slider.
+    _period(at).set_range("2024-10", "2024-11").run()
+    assert _period(at).key == "perf_period_slider_4"
+
+
+def test_dragging_the_slider_then_an_arrow_moves_from_the_dragged_period(three_month_app):
+    at = three_month_app
+    _period(at).set_range("2024-11", "2024-12").run()
+    at.button(key="perf_older").click().run()
+    assert _period(at).value == ("2024-10", "2024-11")
+
+
+# ---- Prices tab: step through the symbols ---------------------------------
+
+@pytest.fixture
+def three_symbol_app(smoke_app, monkeypatch):
+    from ibkr import flex
+
+    aapl = b'<OpenPosition symbol="AAPL"'
+    extra = b"".join(
+        b'<OpenPosition symbol="%s" assetCategory="STK" position="1" costBasisPrice="10" '
+        b'costBasisMoney="10" markPrice="11" positionValue="11" fifoPnlUnrealized="1" '
+        b'currency="USD"/>\n' % name for name in (b"MSFT", b"QTUM")
+    )
+    assert aapl in SYNTHETIC_FLEX_XML
+    xml = SYNTHETIC_FLEX_XML.replace(aapl, extra + aapl, 1)
+    monkeypatch.setattr(flex, "download_statement", lambda token, query_id, date_range: xml)
+    at, _ = smoke_app
+    at.run()
+    assert not at.exception, f"app raised: {[e.value for e in at.exception]}"
+    return at
+
+
+def test_symbol_arrows_step_through_the_symbols_and_stop_at_the_ends(three_symbol_app):
+    at = three_symbol_app
+    assert list(at.selectbox(key="px_symbol").options) == ["AAPL", "MSFT", "QTUM"]
+    assert at.selectbox(key="px_symbol").value == "AAPL"
+    assert at.button(key="px_symbol_prev").disabled and not at.button(key="px_symbol_next").disabled
+
+    at.button(key="px_symbol_next").click().run()
+    assert at.selectbox(key="px_symbol").value == "MSFT"
+    assert not at.button(key="px_symbol_prev").disabled and not at.button(key="px_symbol_next").disabled
+
+    at.button(key="px_symbol_next").click().run()
+    assert at.selectbox(key="px_symbol").value == "QTUM"
+    assert at.button(key="px_symbol_next").disabled
+
+    at.button(key="px_symbol_prev").click().run()
+    assert at.selectbox(key="px_symbol").value == "MSFT"
+    assert not at.exception, f"app raised: {[e.value for e in at.exception]}"
+
+
+def test_symbol_arrows_move_from_a_symbol_picked_in_the_dropdown(three_symbol_app):
+    at = three_symbol_app
+    at.selectbox(key="px_symbol").set_value("QTUM").run()
+    at.button(key="px_symbol_prev").click().run()
+    assert at.selectbox(key="px_symbol").value == "MSFT"
+
+
+def test_symbol_arrows_hidden_with_one_symbol(smoke_app):
+    at, _ = smoke_app
+    at.run()
+    assert not [b for b in at.button if str(b.key).startswith("px_symbol_")]
+
+
+# ---- Prices tab: expense ratio ---------------------------------------------
+
+def test_expense_ratio_tile_shows_the_ratio_and_the_amount_paid(smoke_app, monkeypatch):
+    from data import prices
+
+    asked: list[str] = []
+
+    def fake_expense_ratio(symbol: str) -> float:
+        asked.append(symbol)
+        return 0.4
+
+    monkeypatch.setattr(prices, "fetch_expense_ratio", fake_expense_ratio)
+    at, ctx = smoke_app
+    at.run()
+    assert not at.exception, f"app raised: {[e.value for e in at.exception]}"
+    tile = next(m for m in at.metric if m.label == "Expense Ratio")
+    assert tile.value == "0.40%"
+    # AAPL was bought on 2024-06-01, before the canned closes start (2024-12-27),
+    # so the full history is pulled and the count starts at the first close.
+    assert re.fullmatch(r"≈ [\d,]+\.\d\d USD paid since 2024-12-27", tile.delta), tile.delta
+    assert asked == ["AAPL"]
+    assert ctx["fetch_calls"] == ["AAPL", "AAPL"]
+
+
+def test_expense_ratio_tile_is_blank_for_a_symbol_without_one(smoke_app):
+    at, _ = smoke_app
+    at.run()
+    tile = next(m for m in at.metric if m.label == "Expense Ratio")
+    assert tile.value == "—"
+    assert not tile.delta
