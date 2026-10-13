@@ -1,0 +1,148 @@
+# Build: change a stock's Buy / Sell target directly in the Watchlist table
+
+## Context
+Single-user Streamlit 1.58 dashboard (`app.py`). The Watchlist tab shows one list as a
+table (`app._watchlist_body`, `st.dataframe` with key `wl_table_<list_id>`), and the
+selected stock's tiles and chart below it.
+
+Today a target can be changed only through the **Edit / move / remove: SYMBOL** dialog
+(`_edit_stock_dialog_body`, `_save_edit_stock`): select the row, press the button, type,
+press Save. That is four steps for one number.
+
+Read these first and reuse them; do not build a second copy:
+- `app._watchlist_body`, `app._watchlist_styler`: the table, the row selection and the
+  formatting (per-row currency, `reached`, `no data`, alert colours).
+- `app._save_watchlist`, `app._save_edit_stock`: how a watchlist write is done, how an
+  error is shown, and how the day's backup is refreshed after it.
+- `data/watchlist.py`: `update_item`, `validate_targets`, `table`, `alerts`,
+  `resolve_selection`, `tick_should_rerun`, `dialog_open`.
+- `app._watchlist_tick`: the timed page update. It must not destroy a value being typed.
+- `docs/watchlist-design.md`: decisions D1-D32 and the Streamlit facts. They stay in
+  force unless this prompt changes them.
+- `tests/test_watchlist_app.py`, `tests/test_watchlist.py`, `tests/conftest.py`: how the
+  tab is tested with `AppTest` and how yfinance is stubbed.
+
+## Decisions already made (user, 2026-10-13)
+| # | Topic | Decision |
+|---|-------|----------|
+| E1 | Where | In the table: the **Buy target** and **Sell target** cells of a row are editable. |
+| E2 | Save | At once when the cell edit is committed (Enter or leaving the cell). No Save button. |
+| E3 | Fields | Buy target and Sell target only. Move and remove stay in the dialog. |
+| E4 | Old dialog | **Edit / move / remove** stays unchanged, targets included. |
+| E5 | Row pick | The table becomes `st.data_editor`. The row circle is replaced by a **Show** checkbox column, one ticked at a time, plus the existing ▲ ▼ buttons. A click on another cell no longer picks the stock. This replaces D27 and D32. |
+
+Facts checked in this repo on 2026-10-13:
+- `st.data_editor` in Streamlit 1.58.0 has no `on_select` and no `selection_mode`. Its
+  parameters are: `data, width, height, hide_index, column_order, column_config,
+  num_rows, disabled, key, on_change, args, kwargs, row_height, placeholder`.
+- The current table uses `selection_mode=["single-row-required", "single-cell"]` and
+  writes `st.session_state[table_key]` every run to move the highlight.
+- `watchlist.update_item` already validates and writes both targets in one statement.
+- The suite has 694 tests, all passing.
+
+## What I want
+1. I double-click a **Buy target** or **Sell target** cell, type a number, press Enter.
+   The value is saved.
+2. I empty the cell and press Enter. The target is cleared.
+3. Right after a save, the same run shows the new value everywhere: the table cell,
+   **Above buy** / **Below sell**, the **Alert** column, the stock's tiles, the chart's
+   target line, the alert count in the list dropdown, and the alert box on Overview.
+4. A value that is not allowed is refused: the old value comes back in the cell and a
+   message names the stock and the reason. Nothing is written.
+5. I tick **Show** on a row to see that stock's tiles and chart. ▲ ▼ still work.
+
+## Requirements
+
+### 1. The table
+- Editable columns: **Buy target**, **Sell target**, **Show**. Every other column is
+  disabled.
+- Number cells: `min_value` above 0 is not enough, because 0 and negative input must give
+  the same message as the dialog. Validation is `watchlist.validate_targets` only: one
+  rule, one wording, for the table and the dialog.
+- Keep what the table shows today: per-row currency on **Price**, `reached`, `no data`,
+  `—` for a missing value, the alert colours, numeric sorting, the column help texts.
+  If `st.data_editor` cannot show one of these, list it and ask me; do not drop it
+  silently.
+- The target cells show the same number format as today (`_fmt_price`).
+- The caption under the table is rewritten to say how to edit a target and how to pick a
+  stock.
+
+### 2. Saving
+- One edited cell = one call of `watchlist.update_item` through `_save_watchlist`, so the
+  backup refresh and the error handling stay the same as for the dialog.
+- The edit changes only the edited target. The stock's list and its other target keep
+  the values that are in the DB at save time, not the values the table was drawn with.
+- If several cells changed in one run (Streamlit can deliver them together), save each
+  stock once. One stock failing does not stop the others; each failure gets its message.
+- A value equal to the stored one writes nothing and refreshes no backup.
+- After every run that handled edits, the editor's own edit state is cleared, so a
+  refused value does not stay in the cell and a saved one is not applied twice.
+
+### 3. Refused values
+Same rules and same wording as the dialog:
+- Not a number, 0, negative, infinite.
+- Buy target not below the sell target.
+- The stock was removed or moved in another browser tab since the table was drawn.
+- The DB is busy for more than 5 seconds (D26).
+The message is shown next to the table, not as a toast only, and stays until the next
+successful save or the next list change.
+
+### 4. Picking a stock
+- **Show** is ticked on exactly one row. Ticking another row unticks the previous one.
+  Unticking the ticked row changes nothing (a stock is always shown, as today).
+- D14 (a new session opens on the first alert), D21 (first row after move or remove) and
+  D22 (a user sort does not change the shown stock) still hold.
+- `watchlist.resolve_selection` is reused or replaced by one pure function with unit
+  tests. No selection logic lives only in `app.py`.
+- Remove the session-state keys and code that only served `st.dataframe` selection.
+
+### 5. Timed update and dialogs
+- A timed page update (`_watchlist_tick`) must not lose a value I am typing. Prove in
+  the browser what happens to an open cell editor on a timed full run. If the typed
+  text is lost, stop and ask me before choosing a fix.
+- A price update between drawing the table and saving the edit must not change which
+  stock the edit is applied to: map the edited row to its symbol, never to a row number
+  of a later frame.
+- No dialog opens because of a cell edit.
+
+### 6. Prove in a browser before the rest is built
+Build the smallest version and check on `localhost:8501`:
+1. Edit, clear and refuse of a target cell; what `st.session_state[key]` holds each time.
+2. **Show** with one ticked row, after a sort, after a list change, after an edit.
+3. Which formatting survives on disabled and on editable columns.
+4. An open cell editor during a timed update.
+5. The tab while IBKR is not connected (D18).
+If any of these cannot be built as described, stop and ask me. No silent fallback.
+
+### 7. Tests
+- Unit tests for every new pure function: reading the editor's edits into
+  `(symbol, field, value)`, the single-tick **Show** rule, selection after sort / move /
+  remove.
+- `AppTest` tests, one per item of "What I want" and per refused value in section 3:
+  set, change, clear, refused with the old value back, unchanged value writes nothing,
+  two cells in one run, stock removed in another tab, alert appears and disappears on
+  Overview after an edit, backup refreshed once per save.
+- Existing tests that select a row through `wl_table_<id>` are rewritten for the new
+  control, not deleted. Report each test you changed and why.
+- No test touches the network, my real DB or `.env`.
+- The full suite passes: `.venv/bin/python -m pytest`.
+
+### 8. Documents
+- `docs/watchlist-design.md`: add E1-E5 as decisions, mark D27 and D32 as replaced,
+  update the wireframe of the filled list and add a changelog entry.
+- `README.md`: the Watchlist paragraph says how a target is changed and how a stock is
+  picked.
+
+## Constraints
+- No default parameter values in any new or changed function signature. Callers pass
+  every argument by keyword. No fallback hidden in the body.
+- The DB is irreplaceable. The only rows this feature may change are the
+  `buy_target` and `sell_target` of the edited stock.
+- Do not change the Prices tab, the dialog's behaviour or the schedule.
+
+## Done when
+- Items 1-5 of "What I want" work in the running app, checked in the browser, with a
+  screenshot of each: edit, clear, refused value, alert after an edit, **Show**.
+- The full test suite passes; report the exact count, and any failing test with its
+  output.
+- Report what you did not do or could not verify.
