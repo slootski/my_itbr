@@ -190,8 +190,8 @@ def test_writes_on_a_missing_stock_or_target_list_say_so(db):
     (-1.0, None, "A target must be a number above 0."),
     (float("nan"), None, "A target must be a number above 0."),
     (None, float("inf"), "A target must be a number above 0."),
-    (10.0, 10.0, "The buy target must be below the sell target."),
-    (11.0, 10.0, "The buy target must be below the sell target."),
+    (10.0, 10.0, "Buy below must be lower than Sell above."),
+    (11.0, 10.0, "Buy below must be lower than Sell above."),
 ])
 def test_bad_targets_are_refused_and_nothing_is_saved(db, buy, sell, text):
     quantum = _list(db, "Quantum")
@@ -446,7 +446,7 @@ def test_table_rows_numbers_and_order(three):
     frame = watchlist.table(items=items[items["list_id"] == three["quantum"]],
                             quotes=three["quotes"], positions=positions)
     assert list(frame["symbol"]) == ["IONQ", "BRK-B", "QTUM", "RGTI"]     # alert first, then symbol
-    assert list(frame["alert"]) == ["Buy target reached", "", "", ""]
+    assert list(frame["alert"]) == ["At or below buy price", "", "", ""]
     by = frame.set_index("symbol")
     assert by.loc["IONQ", "above_buy"] == 0.0 and pd.isna(by.loc["IONQ", "day_pct"])   # no previous close
     assert by.loc["QTUM", "above_buy"] == pytest.approx(1.6)

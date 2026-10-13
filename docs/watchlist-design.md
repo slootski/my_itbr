@@ -45,6 +45,7 @@ Answered by the user on 2026-10-12 unless marked "designer".
 | D31 | Pre-sync file without its day file (designer) | Deleted when its day is no longer among the kept days. Kept days = the newest `keep` distinct days over main and pre-sync files together. |
 | D33 | Default selection (user, 2026-10-13) | A list opens with no stock selected: no chart, no tiles, **Edit / move / remove** disabled. A row click, ▲ ▼, the ticker search, adding a stock or the first alert of a new session (D14) selects one. The selected row's circle is expected to clear it (not checked in the browser). The button is primary while a stock is selected. |
 | D34 | List and update buttons (user, 2026-10-13) | **New list**, **Rename** and **Delete** are in one **List actions** menu; opening a dialog closes it. **Update now** and **Update schedule** are borderless text buttons at the right of the status line. |
+| D35 | Wording (user, 2026-10-13) | The screen says **Buy below** and **Sell above**, not "Buy target" and "Sell target". The distance columns are **To buy** and **To sell**. The alert texts are `At or below buy price` and `At or above sell price`. Code and database names keep `buy_target` / `sell_target`. |
 
 Facts that limit the design (checked in this repo and by the reviewers' experiments in
 rounds 1 and 2):
@@ -1439,3 +1440,10 @@ Prices fetched 10:02 · updates: only when I open the app   ↻ Update now  ◷ 
 - Not checked in the browser: the menu's place and alignment, the two text buttons on one
   line with the status text (columns 3:2), the menu closing when a dialog opens, the menu
   across a timed redraw.
+
+### Change — 2026-10-13 — wording (D35, on the user's request)
+
+"Buy target" was not clear. On the screen: **Buy below**, **Sell above**, **To buy**,
+**To sell**; alerts `At or below buy price` / `At or above sell price`; the range error is
+`Buy below must be lower than Sell above.` Earlier sections of this file still use the
+old words. Not checked in the browser.

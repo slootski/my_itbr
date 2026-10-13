@@ -166,7 +166,7 @@ def validate_targets(*, buy_target: float | None, sell_target: float | None) -> 
         if not math.isfinite(value) or value <= 0:
             raise WatchlistError("A target must be a number above 0.")
     if buy_target is not None and sell_target is not None and float(buy_target) >= float(sell_target):
-        raise WatchlistError("The buy target must be below the sell target.")
+        raise WatchlistError("Buy below must be lower than Sell above.")
 
 
 def _target(value: float | None) -> float | None:
@@ -467,7 +467,7 @@ def _opt(value) -> float | None:
 
 TABLE_COLS = ["symbol", "alert", "price", "currency", "day_pct", "buy_target", "above_buy",
               "sell_target", "below_sell", "shares"]
-ALERT_TEXT = {"buy": "Buy target reached", "sell": "Sell target reached"}
+ALERT_TEXT = {"buy": "At or below buy price", "sell": "At or above sell price"}
 
 
 def table(*, items: pd.DataFrame, quotes: dict, positions: pd.DataFrame) -> pd.DataFrame:

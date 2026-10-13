@@ -76,11 +76,11 @@ snapshot for the Net Worth tab.
   what it takes from the holding per year). Optional chart overlays — average
   cost line, MA20/MA50, period mean, buy/sell trade markers — each toggleable.
 - **Watchlist** — named lists of stocks (any yfinance ticker, held or not), each with an
-  optional buy and sell target. A table of the list shows the delayed intraday price, the
+  optional **Buy below** and **Sell above** price. A table of the list shows the delayed intraday price, the
   day change and how far the price is from each target; picking a row (its circle, or ▲ ▼)
   shows the Prices-style tiles and chart with the target lines. Stocks can be added,
-  moved between lists and removed. While a price is at or below its buy target, or at or
-  above its sell target, a **Watchlist alerts** box shows at the top of Overview. Prices
+  moved between lists and removed. While a price is at or below its Buy below price, or at
+  or above its Sell above price, a **Watchlist alerts** box shows at the top of Overview. Prices
   are fetched when the app opens; **Update schedule** can re-fetch every N minutes, for a
   number of hours or with no end time (only while the page is open), and **Update now**
   fetches at once. Lists and targets live in the SQLite store, and every change refreshes

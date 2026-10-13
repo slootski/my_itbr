@@ -66,7 +66,7 @@ class Watch:
         return list(watchlist.read_lists(db_path=self.db)["lists"]["name"])
 
     def table(self) -> pd.DataFrame:
-        return next(d.value for d in self.at.dataframe if "Above buy" in d.value.columns)
+        return next(d.value for d in self.at.dataframe if "To buy" in d.value.columns)
 
     def tab(self):
         return next(tab for tab in self.at.tabs if tab.label == "Watchlist")
@@ -228,7 +228,7 @@ def test_add_and_add_another_keeps_the_dialog_and_empties_it(watch):
      'COPX is already in "Metals". Open that list and use Edit / move / remove to move it here.', 0),
     ("brk.b", None, None, "ok", 'BRK-B is already in "Quantum".', 0),
     ("NEW", 0.0, None, "ok", "A target must be a number above 0.", 0),
-    ("NEW", 10.0, 5.0, "ok", "The buy target must be below the sell target.", 0),
+    ("NEW", 10.0, 5.0, "ok", "Buy below must be lower than Sell above.", 0),
 ])
 def test_a_refused_stock_keeps_the_dialog_open_and_adds_nothing(
         watch, monkeypatch, ticker, buy, sell, status, text, asks):
@@ -272,7 +272,7 @@ def test_edit_opens_with_the_saved_values_and_saves_changes(two_lists):
     assert "**QTUM** · 152.40 USD now" in [m.value for m in at.markdown]
     assert at.selectbox(key="wl_dlg_list").value == ids["Quantum"]
     assert (at.number_input(key="wl_dlg_buy").value, at.number_input(key="wl_dlg_sell").value) == (150.0, 175.0)
-    assert at.number_input(key="wl_dlg_buy").label == "Buy target (USD)"
+    assert at.number_input(key="wl_dlg_buy").label == "Buy below (USD)"
     watch.click("wl_dlg_save")                                # saved untouched: nothing changes
     row = watch.items().set_index("symbol").loc["QTUM"]
     assert (row["buy_target"], row["sell_target"]) == (150.0, 175.0) and not watch.at.toast
@@ -290,7 +290,7 @@ def test_edit_opens_with_the_saved_values_and_saves_changes(two_lists):
 
 @pytest.mark.parametrize(("buy", "sell", "text"), [
     (-5.0, None, "A target must be a number above 0."),
-    (200.0, 175.0, "The buy target must be below the sell target."),
+    (200.0, 175.0, "Buy below must be lower than Sell above."),
 ])
 def test_edit_refuses_bad_targets(two_lists, buy, sell, text):
     watch, _ = two_lists
@@ -303,8 +303,8 @@ def test_edit_refuses_bad_targets(two_lists, buy, sell, text):
 
 
 @pytest.mark.parametrize(("buy", "sell", "line"), [
-    (160.0, None, "QTUM: the price is already at or below your buy target."),
-    (None, 150.0, "QTUM: the price is already at or above your sell target."),
+    (160.0, None, "QTUM: the price is already at or below your Buy below price."),
+    (None, 150.0, "QTUM: the price is already at or above your Sell above price."),
 ])
 def test_a_target_already_reached_is_said_once(two_lists, buy, sell, line):
     watch, _ = two_lists
@@ -403,12 +403,12 @@ def test_a_busy_database_keeps_the_dialog_open(two_lists, monkeypatch):
 def test_table_values_and_order(two_lists):
     watch, _ = two_lists
     frame = watch.table()
-    assert list(frame.columns) == ["Symbol", "Alert", "Price", "Day", "Buy target", "Above buy",
-                                   "Sell target", "Below sell", "Shares held"]
+    assert list(frame.columns) == ["Symbol", "Alert", "Price", "Day", "Buy below", "To buy",
+                                   "Sell above", "To sell", "Shares held"]
     assert list(frame["Symbol"]) == ["IONQ", "QTUM", "RGTI"]
     by = frame.set_index("Symbol")
-    assert by.loc["QTUM", "Above buy"] == pytest.approx(1.6)
-    assert by.loc["QTUM", "Below sell"] == pytest.approx(12.914, abs=1e-3)
+    assert by.loc["QTUM", "To buy"] == pytest.approx(1.6)
+    assert by.loc["QTUM", "To sell"] == pytest.approx(12.914, abs=1e-3)
     assert pd.isna(by.loc["RGTI", "Price"]) and by.loc["RGTI", "Alert"] == ""
     watchlist.update_item(db_path=watch.db, symbol="RGTI", list_id=by.shape[0] and
                           watch.at.session_state["wl_list"], buy_target=9.0, sell_target=None)
@@ -416,7 +416,7 @@ def test_table_values_and_order(two_lists):
     watch.click("wl_update_now")
     frame = watch.table()
     assert list(frame["Symbol"]) == ["RGTI", "IONQ", "QTUM"]  # the alert row first
-    assert frame.loc[0, "Alert"] == "Buy target reached" and frame.loc[0, "Above buy"] == 0.0
+    assert frame.loc[0, "Alert"] == "At or below buy price" and frame.loc[0, "To buy"] == 0.0
     assert watch.at.session_state["wl_symbol"] == "QTUM"      # the selection stayed on its stock
 
 
@@ -574,13 +574,13 @@ def test_no_stock_is_selected_until_one_is_picked(watch):
 def test_detail_of_an_unheld_stock(two_lists):
     watch, _ = two_lists
     assert list(watch.metrics()) == [
-        "Current price (delayed)", "Buy target", "Sell target", "Period return (1y)",
+        "Current price (delayed)", "Buy below", "Sell above", "Period return (1y)",
         "Period mean (1y)", "Period high / low (1y)", "52-week high / low", "Avg volume",
         "Volatility (ann.)", "ATR(14)", "Expense Ratio"]
     metrics = watch.metrics()
     assert metrics["Current price (delayed)"] == ("152.40 USD", "+1.50 (+0.99%)")
-    assert metrics["Buy target"] == ("150.00", "price 1.60% above target")
-    assert metrics["Sell target"] == ("175.00", "price 12.91% below target")
+    assert metrics["Buy below"] == ("150.00", "price 1.60% above target")
+    assert metrics["Sell above"] == ("175.00", "price 12.91% below target")
     boxes = {c.key: c for c in watch.at.checkbox if str(c.key).startswith("wl_")}
     assert boxes["wl_cost"].disabled and boxes["wl_trades"].disabled and not boxes["wl_targets"].disabled
     assert boxes["wl_trades"].label == "My trades"
@@ -592,7 +592,7 @@ def test_detail_of_a_stock_without_targets_or_quote(two_lists):
     watch.run()
     metrics = watch.metrics()
     assert metrics["Current price (delayed)"][0] == "—"
-    assert metrics["Buy target"] == ("—", "")
+    assert metrics["Buy below"] == ("—", "")
     assert next(c for c in watch.at.checkbox if c.key == "wl_targets").disabled
 
 
@@ -603,7 +603,7 @@ def test_a_held_and_watched_stock_shows_the_position_tiles_on_both_tabs(watch):
     watch.at.session_state["wl_symbol"] = "AAPL"
     at = watch.run()                                           # two equal charts in one run: no clash
     assert list(watch.metrics()) == [
-        "Current price (delayed)", "Buy target", "Sell target", "Position",
+        "Current price (delayed)", "Buy below", "Sell above", "Position",
         "My avg cost", "Unrealized P&L", "Total return incl. divs", "Period return (1y)",
         "Period mean (1y)", "Period high / low (1y)", "52-week high / low", "Avg volume",
         "Volatility (ann.)", "ATR(14)", "Expense Ratio", "Yield (TTM) / on cost",

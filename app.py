@@ -612,8 +612,8 @@ def _render_price_detail(
 
     tiles = {
         "current": current,
-        "buy_target": lambda col: target(col, "Buy target", buy_target, "buy"),
-        "sell_target": lambda col: target(col, "Sell target", sell_target, "sell"),
+        "buy_target": lambda col: target(col, "Buy below", buy_target, "buy"),
+        "sell_target": lambda col: target(col, "Sell above", sell_target, "sell"),
         "avg_cost": lambda col: col.metric(
             "My avg cost", _fmt_money(stats["avg_cost"], ccy),
             f"basis {_fmt_money(stats['cost_basis'], ccy)}"
@@ -923,9 +923,9 @@ def _target_notice(*, symbol: str, price: float | None, buy_target: float | None
     if price is None:
         return None
     if buy_target is not None and price <= buy_target:
-        return f"{symbol}: the price is already at or below your buy target."
+        return f"{symbol}: the price is already at or below your Buy below price."
     if sell_target is not None and price >= sell_target:
-        return f"{symbol}: the price is already at or above your sell target."
+        return f"{symbol}: the price is already at or above your Sell above price."
     return None
 
 
@@ -1089,8 +1089,8 @@ def _add_stock_dialog_body(*, payload: dict) -> None:
     _dialog_guard()
     st.text_input("Ticker", key="wl_dlg_ticker")
     currency_help = "In the quote's currency. London stocks quote in pence."
-    _target_field(label="Buy target", key="wl_dlg_buy", price=None, help_text=currency_help)
-    _target_field(label="Sell target", key="wl_dlg_sell", price=None, help_text=currency_help)
+    _target_field(label="Buy below", key="wl_dlg_buy", price=None, help_text=currency_help)
+    _target_field(label="Sell above", key="wl_dlg_sell", price=None, help_text=currency_help)
     _dialog_messages()
     cancel, another, add = st.columns(3)
     cancel.button("Cancel", key="wl_dlg_cancel", on_click=_close_watchlist_dialog, width="stretch")
@@ -1109,8 +1109,8 @@ def _edit_stock_dialog_body(*, payload: dict) -> None:
     st.selectbox("List", list(names), format_func=lambda list_id: names[list_id],
                  key="wl_dlg_list", index=None, placeholder="Pick a list")
     unit = f" ({ccy})" if ccy else ""
-    _target_field(label=f"Buy target{unit}", key="wl_dlg_buy", price=price, help_text=None)
-    _target_field(label=f"Sell target{unit}", key="wl_dlg_sell", price=price, help_text=None)
+    _target_field(label=f"Buy below{unit}", key="wl_dlg_buy", price=price, help_text=None)
+    _target_field(label=f"Sell above{unit}", key="wl_dlg_sell", price=price, help_text=None)
     _dialog_messages()
     _dialog_buttons(label="Save", on_save=_save_edit_stock, save_kwargs={})
     st.divider()
@@ -1255,8 +1255,8 @@ def _watchlist_styler(*, frame: pd.DataFrame):
     """The list's table: numbers underneath (so sorting is numeric), text on top."""
     shown = frame.rename(columns={
         "symbol": "Symbol", "alert": "Alert", "price": "Price", "day_pct": "Day",
-        "buy_target": "Buy target", "above_buy": "Above buy", "sell_target": "Sell target",
-        "below_sell": "Below sell", "shares": "Shares held",
+        "buy_target": "Buy below", "above_buy": "To buy", "sell_target": "Sell above",
+        "below_sell": "To sell", "shares": "Shares held",
     })
     currencies = list(shown["currency"])
     shown = shown.drop(columns="currency")
@@ -1267,8 +1267,8 @@ def _watchlist_styler(*, frame: pd.DataFrame):
     # na_rep, not the callables: Styler does not pass a missing value to them.
     styler = shown.style.format({
         "Day": lambda value: f"{value:+.2f}%",
-        "Buy target": _fmt_price, "Sell target": _fmt_price,
-        "Above buy": left, "Below sell": left, "Shares held": _fmt_qty,
+        "Buy below": _fmt_price, "Sell above": _fmt_price,
+        "To buy": left, "To sell": left, "Shares held": _fmt_qty,
     }, na_rep="—")
     # One format per row: the currency belongs to the row, not to the column.
     for index, currency in zip(shown.index, currencies):
@@ -1473,8 +1473,8 @@ def _watchlist_body(
         # Streamlit draws its own text in a missing cell, whatever the Styler says.
         placeholder="—",
         column_config={
-            "Above buy": st.column_config.Column(help="How far the price is above your buy target"),
-            "Below sell": st.column_config.Column(help="How far the price is below your sell target"),
+            "To buy": st.column_config.Column(help="How far the price is above your Buy below price"),
+            "To sell": st.column_config.Column(help="How far the price is below your Sell above price"),
             "Price": st.column_config.Column(help="yfinance quote; may be delayed"),
         },
     )
