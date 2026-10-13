@@ -123,6 +123,9 @@ def test_create_rename_delete_a_list(watch):
     assert watch.lists() == ["Quantum"]
     assert '"Quantum" is empty. Add a stock to see its price and set targets.' in [i.value for i in at.info]
     assert not watch.has("wl_schedule")                       # nothing watched: no schedule line
+    edit = at.button(key="wl_edit_stock")                     # an empty list: shown, plain and disabled
+    assert edit.label == "Edit / move / remove" and edit.disabled and edit.proto.type == "secondary"
+    assert at.button(key="wl_add_stock").proto.type == "secondary" and not at.button(key="wl_add_stock").disabled
 
     at = watch.click("wl_rename_list")
     assert at.text_input(key="wl_dlg_name").value == "Quantum"    # opens with the current name

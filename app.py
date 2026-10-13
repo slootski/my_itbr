@@ -725,6 +725,8 @@ def _render_price_detail(
 
 _WL_LIST = "wl_list"
 _WL_SYMBOL = "wl_symbol"
+# Column widths of the stock buttons' row: Add stock, Edit / move / remove, the rest.
+_WL_STOCK_ROW = [1.2, 2.4, 5]
 _WL_DIALOG = "wl_dialog"
 _QUOTE_WORKERS = 6
 
@@ -1385,7 +1387,12 @@ def _watchlist_body(
     add_kwargs = {"kind": "add_stock", "payload": {"list_id": list_id, "list_name": list_name}}
     if list_items.empty:
         st.info(f'"{list_name}" is empty. Add a stock to see its price and set targets.')
-        st.button("＋ Add stock", key="wl_add_stock", on_click=_open_watchlist_dialog, kwargs=add_kwargs)
+        # The same row as a filled list, so the buttons do not move when a stock is added.
+        add, edit, _ = st.columns(_WL_STOCK_ROW)
+        add.button("＋ Add stock", key="wl_add_stock", on_click=_open_watchlist_dialog,
+                   kwargs=add_kwargs, width="stretch")
+        edit.button("Edit / move / remove", key="wl_edit_stock", type="secondary", disabled=True,
+                    help="Add a stock first", width="stretch")
         return
 
     if all(quotes[symbol] is None for symbol in items["symbol"] if symbol in quotes) and quotes:
@@ -1425,7 +1432,7 @@ def _watchlist_body(
     st.session_state["wl_rows_seen"], st.session_state["wl_order_seen"] = marked, order
     st.session_state["wl_table_seen"] = table_key
 
-    add, edit, up, down, _ = st.columns([1.2, 2.4, 0.5, 0.5, 4])
+    add, edit, up, down, _ = st.columns([*_WL_STOCK_ROW[:2], 0.5, 0.5, 4])
     add.button("＋ Add stock", key="wl_add_stock", on_click=_open_watchlist_dialog,
                kwargs=add_kwargs, width="stretch")
     if len(order) > 1:

@@ -1415,3 +1415,5 @@ Run in Chrome against a scratch copy of the database.
 - Not checked in the browser with `single-row` (tests set the table's state by hand):
   the selected row's circle sends an empty selection; a cell click on an unmarked row
   marks it; a user sort keeps the mark (D22).
+- Later the same day, on the user's request: an empty list also shows **Edit / move /
+  remove**, disabled and plain, next to **＋ Add stock**.
