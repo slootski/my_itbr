@@ -812,6 +812,21 @@ def _fetched_text(*, state: dict) -> str:
     return watchlist.fetched_label(fetched=state["fetched"], now=state["now"], tz=watchlist.local_tz())
 
 
+# The alert box must be seen without being looked for: an amber fill and a thick
+# left bar, in tints that read on the light and on the dark theme.
+_WL_ALERT_CSS = """
+<style>
+.st-key-wl_alert_box {
+  background: rgba(250, 178, 25, 0.16);
+  border: 1px solid #d99a0e !important;
+  border-left: 8px solid #d99a0e !important;
+  border-radius: 0.5rem;
+}
+.st-key-wl_alert_box p { font-size: 1.1rem; }
+</style>
+"""
+
+
 def _render_watchlist_alerts(*, state: dict) -> None:
     """The box at the top of Overview: every stock at its buy or sell target."""
     # The slot always exists, so the box coming and going cannot shift the tabs' identity.
@@ -833,15 +848,20 @@ def _render_watchlist_alerts(*, state: dict) -> None:
         return
     if not found["lines"] and not found["missing"]:
         return
-    with slot.container(border=True):
-        count = len(found["lines"])
-        st.markdown(f"**Watchlist alerts ({count})**" if count else "**Watchlist prices**")
+    count = len(found["lines"])
+    if count:
+        slot.html(_WL_ALERT_CSS)
+    # Only a reached price gets the loud box; a missing price stays a plain one.
+    with slot.container(border=True, key="wl_alert_box" if count else "wl_prices_box"):
+        # No title on the alerts: each line says what it is.
+        if not count:
+            st.markdown("**Watchlist prices**")
         for line in found["lines"]:
             buy = line["side"] == "buy"
             badge = ":green-badge[BUY]" if buy else ":red-badge[SELL]"
             st.markdown(
-                f"{badge} **{line['symbol']}** {_fmt_money(line['price'], line['currency'])} is at or "
-                f"{'below' if buy else 'above'} your {'buy' if buy else 'sell'} target "
+                f":material/notifications_active: {badge} **{line['symbol']}** {_fmt_money(line['price'], line['currency'])} is at or "
+                f"{'below' if buy else 'above'} your {'Buy below' if buy else 'Sell above'} price "
                 f"{_fmt_price(line['target'])} · {line['list_name']}"
             )
         if found["missing"]:

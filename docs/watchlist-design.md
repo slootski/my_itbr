@@ -1447,3 +1447,11 @@ Prices fetched 10:02 · updates: only when I open the app   ↻ Update now  ◷ 
 **To sell**; alerts `At or below buy price` / `At or above sell price`; the range error is
 `Buy below must be lower than Sell above.` Earlier sections of this file still use the
 old words. Not checked in the browser.
+
+### Change — 2026-10-13 — louder alert box (on the user's request)
+
+The user would not have noticed the box. Now, when a price is reached: an amber fill with
+a thick amber left bar, larger text, a bell icon on each line, and no "Watchlist alerts
+(N)" title (the user asked to remove it). The line reads `BUY AMKBY 18.48 USD is at or
+below your Buy below price 19.00 · Buy list`. The box for a missing price only stays plain
+with its "Watchlist prices" title. Not checked in the browser.

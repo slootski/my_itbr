@@ -631,11 +631,11 @@ def test_overview_alert_box(watch):
     watch.quotes = {"IONQ": _q(41.10, 42.0), "QTUM": _q(152.40, 150.90), "COPX": _q(61.30, 61.0)}
     at = watch.run()
     box = _box(watch)
-    assert "**Watchlist alerts (2)**" in box
+    assert not [text for text in box if "Watchlist alerts" in text]   # no title: the lines say it
     lines = [text for text in box if "badge" in text]
     assert lines == [
-        ":green-badge[BUY] **IONQ** 41.10 USD is at or below your buy target 42.00 · Quantum",
-        ":red-badge[SELL] **COPX** 61.30 USD is at or above your sell target 60.00 · Metals"]
+        ":material/notifications_active: :green-badge[BUY] **IONQ** 41.10 USD is at or below your Buy below price 42.00 · Quantum",
+        ":material/notifications_active: :red-badge[SELL] **COPX** 61.30 USD is at or above your Sell above price 60.00 · Metals"]
     assert "No price for: RGTI. Its target was not checked." in _texts(at)   # NOTGT has no target
     assert any(text.startswith("Fetched 10:07.") for text in box)
     assert not [b for b in next(t for t in at.tabs if t.label == "Overview").button]   # D16
@@ -815,7 +815,7 @@ def test_watchlist_works_without_credentials(monkeypatch, tmp_path):
     assert "IBKR not connected: positions not shown." in texts
     assert "Save a token above to connect." in texts
     assert any("Net Worth appears here" in text for text in texts)
-    assert ":green-badge[BUY] **IONQ** 41.10 USD is at or below your buy target 42.00 · Quantum" in texts
+    assert ":material/notifications_active: :green-badge[BUY] **IONQ** 41.10 USD is at or below your Buy below price 42.00 · Quantum" in texts
     assert pd.isna(watch.table().loc[0, "Shares held"])
     assert "flex_failed" not in at.session_state
     watch.click("wl_edit_stock")                               # the tab is usable
