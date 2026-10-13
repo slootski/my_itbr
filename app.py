@@ -846,10 +846,6 @@ def _open_alert_stock(*, symbol: str, list_id: int, tab_key: str | None) -> None
         st.session_state[tab_key] = "Watchlist"
 
 
-def _open_overview() -> None:
-    st.session_state[_TABS_MAIN] = "Overview"
-
-
 def _mute_alert(*, symbol: str, side: str, kind: str) -> None:
     """Button callback: hide one alert for an hour or until tomorrow."""
     now, tz = watchlist.utc_now(), watchlist.local_tz()
@@ -954,7 +950,8 @@ def _render_watchlist_alerts(*, state: dict, tab_key: str | None) -> None:
         _render_hidden_alerts(hidden=hidden, state=state)
 
 
-# The bell at the top right rings while an alert is shown and the user is on another tab.
+# The bell rings while an alert is shown and the Watchlist tab is not the open one.
+# It is pinned to the app's top bar, left of Streamlit's own "Deploy", above the bar's layer.
 _WL_BELL_CSS = """
 <style>
 @keyframes wl-ring {
@@ -963,9 +960,13 @@ _WL_BELL_CSS = """
   24% { transform: rotate(14deg); } 32% { transform: rotate(-10deg); }
   40% { transform: rotate(6deg); } 48% { transform: rotate(-3deg); }
 }
-.st-key-wl_bell button { color: #d99a0e; font-weight: 700; }
+.st-key-wl_bell {
+  position: fixed; top: 0.45rem; right: 8.5rem; z-index: 1000001; width: auto !important;
+}
+.st-key-wl_bell button, .st-key-wl_bell button:hover { color: #e02424; }
+.st-key-wl_bell button p { font-size: 1.25rem; font-weight: 800; }
 .st-key-wl_bell button [data-testid="stIconMaterial"] {
-  font-size: 1.9rem; transform-origin: 50% 10%; animation: wl-ring 1.6s ease-in-out infinite;
+  font-size: 2.4rem; transform-origin: 50% 10%; animation: wl-ring 1.6s ease-in-out infinite;
 }
 @media (prefers-reduced-motion: reduce) {
   .st-key-wl_bell button [data-testid="stIconMaterial"] { animation: none; }
@@ -974,16 +975,18 @@ _WL_BELL_CSS = """
 """
 
 
-def _render_alert_bell(*, slot, state: dict) -> None:
-    """A ringing bell at the top right that opens Overview, where the alert box is."""
-    count = len(_alert_lines(state=state)["shown"])
-    on_overview = _TABS_MAIN not in st.session_state or st.session_state[_TABS_MAIN] == "Overview"
-    if not count or on_overview:
+def _render_alert_bell(*, state: dict) -> None:
+    """A ringing bell in the top bar that opens the Watchlist on the first shown alert."""
+    shown = _alert_lines(state=state)["shown"]
+    on_watchlist = _TABS_MAIN in st.session_state and st.session_state[_TABS_MAIN] == "Watchlist"
+    if not shown or on_watchlist:
         return
-    slot.html(_WL_BELL_CSS)
-    slot.button(str(count), key="wl_bell", type="tertiary", icon=":material/notifications_active:",
-                help=f"{_alert_count(count=count)} on your watchlist. Click to open Overview.",
-                on_click=_open_overview)
+    count, first = len(shown), shown[0]
+    st.html(_WL_BELL_CSS)
+    st.button(str(count), key="wl_bell", type="tertiary", icon=":material/notifications_active:",
+              help=f"{_alert_count(count=count)} on your watchlist. Click to open the Watchlist.",
+              on_click=_open_alert_stock,
+              kwargs={"symbol": first["symbol"], "list_id": int(first["list_id"]), "tab_key": _TABS_MAIN})
 
 
 # -- dialogs: one at a time, opened by a flag and closed by callbacks ---------
@@ -2786,9 +2789,7 @@ def _render_offline_tabs(*, watch_state: dict) -> None:
 
 def main() -> None:
     sidebar_status = render_sidebar()
-    head, bell_col = st.columns([8, 1], vertical_alignment="center")
-    head.title("📈 IBKR Dashboard")
-    bell_slot = bell_col.container(horizontal=True, horizontal_alignment="right")
+    st.title("📈 IBKR Dashboard")
     if _CONNECT_SAVED in st.session_state:
         del st.session_state[_CONNECT_SAVED]
         st.success("Connected to IBKR.")
@@ -2849,7 +2850,7 @@ def main() -> None:
 
     sidebar_status.success("IBKR: connected")
     render_sync_status(report=data["sync"])
-    _render_alert_bell(slot=bell_slot, state=watch_state)
+    _render_alert_bell(state=watch_state)
     overview, positions, trades, price, watch, divs, perf, net_worth = st.tabs(
         ["Overview", "Positions", "Trades", "Prices", "Watchlist", "Dividends", "Performance",
          "Net Worth"], key=_TABS_MAIN, on_change="rerun",

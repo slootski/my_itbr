@@ -667,21 +667,24 @@ def test_alert_link_opens_the_watchlist_on_that_stock(watch):
     assert at.button(key="wl_edit_stock").label == "Edit / move / remove: QTUM"
 
 
-def test_bell_shows_off_overview_and_leads_back_to_it(watch):
-    watch.seed(lists={"Quantum": [("IONQ", 42.0, None), ("QTUM", 150.0, None)]})
-    watch.quotes = {"IONQ": _q(41.10, 42.0), "QTUM": _q(140.0, 150.0)}
-    watch.run()
-    assert not watch.has("wl_bell")                           # on Overview the box itself is in view
-    watch.at.session_state["tabs_main"] = "Trades"
+def test_bell_shows_off_the_watchlist_tab_and_opens_it_on_the_first_alert(watch):
+    ids = watch.seed(lists={"Metals": [("COPX", None, None)], "Quantum": [("IONQ", 42.0, None), ("QTUM", 150.0, None)]})
+    watch.quotes = {"COPX": _q(61.30, 61.0), "IONQ": _q(41.10, 42.0), "QTUM": _q(140.0, 150.0)}
     at = watch.run()
-    bell = at.button(key="wl_bell")
+    bell = at.button(key="wl_bell")                           # on Overview too
     assert bell.label == "2" and bell.proto.type == "tertiary"
+    at.session_state["wl_list"], at.session_state["wl_symbol"] = ids["Metals"], "COPX"
     at = watch.click("wl_bell")
-    assert at.session_state["tabs_main"] == "Overview" and not watch.has("wl_bell")
+    assert at.session_state["tabs_main"] == "Watchlist" and not watch.has("wl_bell")
+    assert at.session_state["wl_list"] == ids["Quantum"] and at.session_state["wl_symbol"] == "IONQ"
     # AppTest has no browser to send the open tab back, so it is set before each run.
+    watch.at.session_state["tabs_main"] = "Trades"
+    watch.run()
     watch.click("wl_alert_today_IONQ_buy")                    # one alert hidden: the bell counts the rest
     watch.at.session_state["tabs_main"] = "Trades"
     assert watch.run().button(key="wl_bell").label == "1"
+    at = watch.click("wl_bell")
+    assert at.session_state["wl_symbol"] == "QTUM"            # the first alert still shown
     watch.click("wl_alert_snooze_QTUM_buy")
     watch.at.session_state["tabs_main"] = "Trades"
     watch.run()

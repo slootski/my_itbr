@@ -47,7 +47,7 @@ Answered by the user on 2026-10-12 unless marked "designer".
 | D34 | List and update buttons (user, 2026-10-13) | **New list**, **Rename** and **Delete** are in one **List actions** menu; opening a dialog closes it. **Update now** and **Update schedule** are borderless text buttons at the right of the status line. |
 | D35 | Wording (user, 2026-10-13) | The screen says **Buy below** and **Sell above**, not "Buy target" and "Sell target". The distance columns are **To buy** and **To sell**. The alert texts are `At or below buy price` and `At or above sell price`. Code and database names keep `buy_target` / `sell_target`. |
 | D36 | Alert actions (user, 2026-10-13) | **Open in Watchlist** opens the Watchlist tab on the alert's list and stock. **Snooze 1 hour** hides the alert for 60 minutes; **Hide for today** hides it until the next local midnight. Hidden alerts are stored in the database, so a restart keeps them hidden. A line `Hidden: SYMBOL until TIME` with **Show hidden alerts** brings them back. Editing a stock shows its alert again. Hiding changes the Overview box and the bell only: the Watchlist table's Alert column, the `(N alerts)` counts and the opening list (D14) do not change. |
-| D37 | Bell (user, 2026-10-13) | While an alert is shown and the open tab is not Overview, a ringing bell with the alert count is at the top right, on the title's row. A click opens Overview. Not in the layouts without an Overview tab (IBKR not connected or failed): there the box is above the tabs. The main tabs now track their state, so every tab click reruns the app. |
+| D37 | Bell (user, 2026-10-13) | While an alert is shown and the open tab is not Watchlist, a red ringing bell with the alert count is pinned to the app's top bar, left of "Deploy". A click opens the Watchlist on the first shown alert's list and stock. Not in the layouts without the main tabs (IBKR not connected or failed): there the box is above the tabs. The main tabs now track their state, so every tab click reruns the app. |
 
 Facts that limit the design (checked in this repo and by the reviewers' experiments in
 rounds 1 and 2):
@@ -1486,3 +1486,8 @@ with its "Watchlist prices" title. Not checked in the browser.
 - Not checked in the browser: the tab really switches on a click; the bell's place on the
   title's row and that it rings (the CSS targets `[data-testid="stIconMaterial"]`); the
   three buttons fit on the alert's line.
+- Later the same day, on the user's request (changes D37): the bell is red and larger, is
+  pinned to the app's top bar left of "Deploy" (`position: fixed`), is shown on every tab
+  but Watchlist, and a click opens the Watchlist on the first shown alert's list and stock.
+  Not checked in the browser: its place and height next to "Deploy", and that it is above
+  the bar and can be clicked.
