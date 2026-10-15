@@ -236,10 +236,13 @@ A **Period** slider with two handles picks the months, `◀ ▶` slide the perio
 by a month, and quick periods (1M, 3M, 6M, 1Y, YTD, All) set it in one click.
 One month shows its days; several months show one row per month, with a
 line of the running return day by day (linked daily returns, from 0% at the
-month's start, each row on its own scale) and the month's return, P&L and
-fees, and clicking a row opens that month. The line has one point per day with
-a close; days without one are skipped. The number at each point is that day's
-own return in percent (not shown when the chart is too narrow for them).
+month's start) and the month's return, P&L and fees, and clicking a row opens
+that month. All rows share one vertical scale, so a big month looks bigger
+than a small one. Each day sits at its date in the month, so a date is at the
+same place in every row and a month still running ends part way across. Days
+without a close have no point. The number at each point is that day's own
+return in percent, put on the side the line bends away from (not shown when
+the chart is too narrow for them).
 
 Hovering a day shows its numbers and the **best and worst ticker** of the day,
 ranked by price change. **Clicking a day** opens its details: P&L per ticker as
@@ -261,7 +264,13 @@ versus everything else, the day's cash events and its trades. The metrics above
 - Direction is shown three ways (tint hue, arrow, sign) and size by four fixed
   tint steps (0.25%, 0.75%, 1.5%), so the calendar does not rely on colour.
 - **No data**: a weekday with no close; the next day's figure covers both.
-  **Pending**: no close yet. A ring marks a deposit or withdrawal day.
+  **Pending**: no close yet. **Market closed**: a US market (NYSE) holiday.
+  A ring marks a deposit or withdrawal day.
+- IBKR files a row on a market holiday too, with NAV moved only by interest.
+  It is dropped: the next trading day is measured against the close before
+  the holiday and takes the holiday's small change. Holidays come from the
+  exchange's regular rules (`data/market_calendar.py`), not from an unchanged
+  NAV; one-off closures are not in the list.
 
 Closes come from the statement's `EquitySummaryInBase` and are stored in the
 insert-only table `equity_daily`, so days older than the Flex window keep their
@@ -273,8 +282,9 @@ price and mark-to-market P&L per symbol per day) and are stored in the
 insert-only table `symbol_daily` for the same reason. That P&L covers shares
 held coming into the day; shares traded that day are in "everything else".
 
-Implementation: `data/performance.py` (calculation), `charts/perf_calendar.py`
-(markup), `tab_performance` in `app.py`; tests: `tests/test_performance.py`,
+Implementation: `data/performance.py` (calculation), `data/market_calendar.py`
+(holidays), `charts/perf_calendar.py` (markup), `tab_performance` in `app.py`;
+tests: `tests/test_performance.py`, `tests/test_market_calendar.py`,
 `tests/test_perf_calendar.py`.
 
 ## Notes

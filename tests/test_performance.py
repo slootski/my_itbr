@@ -245,6 +245,41 @@ def test_month_weeks_cell_fields(daily):
     assert not weeks[0]["days"][0]["gap"]
 
 
+def test_market_holiday_close_is_dropped():
+    """IBKR files a row on Labor Day (7 Sep 2026) with NAV moved by interest only.
+    It is no trading day: Tuesday is measured against Friday, the holiday's drift
+    lands in Tuesday, and a deposit dated on the holiday counts on Tuesday."""
+    daily = performance.daily(
+        closes=_closes([(D(2026, 9, 4), 1000.0), (D(2026, 9, 7), 999.9), (D(2026, 9, 8), 1110.0)]),
+        flows={D(2026, 9, 7): 100.0},
+    )
+    assert list(daily["date"]) == [D(2026, 9, 4), D(2026, 9, 8)]
+    tuesday = daily.iloc[1]
+    assert tuesday["prev_date"] == D(2026, 9, 4) and tuesday["flow"] == 100.0
+    assert tuesday["pnl"] == pytest.approx(10.0)
+    assert tuesday["ret"] == pytest.approx(1110 / 1100 - 1)
+
+
+def test_month_weeks_marks_a_market_holiday_closed_and_the_next_day_is_no_gap():
+    daily = performance.daily(
+        closes=_closes([(D(2026, 9, 4), 1000.0), (D(2026, 9, 7), 999.9), (D(2026, 9, 8), 1010.0)]), flows={},
+    )
+    weeks = performance.month_weeks(daily=daily, details={}, year=2026, month=9, today=D(2026, 9, 8))
+    monday, tuesday = weeks[1]["days"][0], weeks[1]["days"][1]
+    assert (monday["date"], monday["state"]) == (D(2026, 9, 7), performance.CLOSED)
+    assert tuesday["state"] == performance.GAIN and not tuesday["gap"]
+    assert weeks[1]["summary"]["days"] == 1                # the holiday is not a day of the week's result
+
+
+def test_a_holiday_inside_a_real_gap_still_is_a_gap():
+    """Fri 3 Jul 2026 is a holiday; Thu 2 Jul missing is a hole in the data."""
+    daily = performance.daily(closes=_closes([(D(2026, 7, 1), 1000.0), (D(2026, 7, 6), 1010.0)]), flows={})
+    weeks = performance.month_weeks(daily=daily, details={}, year=2026, month=7, today=D(2026, 7, 6))
+    states = [cell["state"] for cell in weeks[0]["days"]]
+    assert states[2:] == [performance.FLAT, performance.NO_DATA, performance.CLOSED]
+    assert weeks[1]["days"][0]["gap"]
+
+
 def test_week_summary_covers_only_this_months_days(daily):
     weeks = performance.month_weeks(daily=daily, details={}, year=2026, month=3, today=TODAY)
     assert weeks[0]["summary"]["pnl"] == pytest.approx(0.0)   # 10 + 12 + 0 - 22

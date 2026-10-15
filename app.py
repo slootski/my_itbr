@@ -2254,11 +2254,12 @@ def _render_perf_month(*, weeks: list[dict], currency: str | None, dark: bool) -
 def _render_perf_rows(*, months: list[dict], with_data: set[str], dark: bool) -> None:
     """One row per month of the period; a row with data opens its month when clicked."""
     st.html(perf_calendar.rows_legend_html(dark=dark))
+    scale = perf_calendar.period_scale(months=months)
     for month in months:
         key = _month_key(year=month["year"], month=month["month"])
         suffix = key.replace("-", "_")
         with st.container(key=f"{perf_calendar.ROW_KEY_PREFIX}{suffix}"):
-            st.html(perf_calendar.month_row_html(month=month, dark=dark))
+            st.html(perf_calendar.month_row_html(month=month, scale=scale, dark=dark))
             if key in with_data:
                 st.button(
                     f"Open {_month_label(key)}", key=f"{perf_calendar.OPEN_KEY_PREFIX}{suffix}",
@@ -2446,13 +2447,15 @@ def tab_performance(*, data: dict) -> None:
             "- **Week**, month and year figures link the daily returns together; they are "
             "not a sum of the percents.\n"
             "- **No data**: a weekday with no close from IBKR. The next day's figure then "
-            "covers both days. **Pending**: no close yet (today).\n"
+            "covers both days. **Pending**: no close yet (today). **Market closed**: a US "
+            "market holiday; the next day is measured from the close before it.\n"
             "- Hover a day for the close, the best and worst ticker of the day (by price "
             "change), the deposit, dividends received, fees and trades. **Click a day** for "
             "its details: P&L by ticker and the day's trades.\n"
             "- **Period**: drag the slider's two ends, use ◀ ▶ to move the period by a "
             "month, or pick a quick period. Several months show one row per month: "
-            "the line is the return since the month's start, day by day. Click a row to open "
+            "the line is the return since the month's start, day by day. Each day sits at its "
+            "date, so the rows line up, and all rows share one scale. Click a row to open "
             "that month."
         )
     with st.expander("Daily table"):

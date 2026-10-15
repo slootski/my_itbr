@@ -22,6 +22,9 @@ Three rules the data forces:
 * The previous close is the previous *row*. Weekends have no close, so Monday
   is measured against Friday; a real gap in the data widens the same way and
   is exposed through ``prev_date``.
+* IBKR files a row on a market holiday too, with NAV moved only by interest.
+  It is not a trading day: it is dropped, and the next day is measured against
+  the close before the holiday (``data.market_calendar``).
 
 Dividends, payments in lieu and interest are part of the return, not a flow.
 """
@@ -33,7 +36,7 @@ import logging
 
 import pandas as pd
 
-from data import capital, div_ledger
+from data import capital, div_ledger, market_calendar
 
 logger = logging.getLogger("myitbr.performance")
 
@@ -63,7 +66,7 @@ TINT_BOUNDS = (0.0025, 0.0075, 0.015)
 WEEKDAYS = 5
 
 GAIN, LOSS, FLAT = "gain", "loss", "flat"
-NO_DATA, PENDING, EMPTY = "nodata", "pending", "empty"
+NO_DATA, PENDING, EMPTY, CLOSED = "nodata", "pending", "empty", "closed"
 
 
 def _to_date(*, value) -> dt.date | None:
@@ -155,11 +158,13 @@ def daily(*, closes: pd.DataFrame, flows: dict[dt.date, float]) -> pd.DataFrame:
     row has no previous close inside the series only when no earlier close
     exists, and then carries no result. A flow dated on a day without a close
     is counted on the next close. ``ret`` is None when there was no capital to
-    earn on (``prev_nav + flow <= 0``).
+    earn on (``prev_nav + flow <= 0``). Closes on a market holiday are dropped,
+    so a flow on one counts on the next trading day.
     """
     if closes is None or closes.empty:
         return pd.DataFrame(columns=DAILY_COLS)
-    records = closes.to_dict("records")
+    records = [row for row in closes.to_dict("records")
+               if not market_calendar.is_holiday(date=row["date"])]
     funded = next((i for i, row in enumerate(records) if row["nav"] > 0), None)
     if funded is None:
         return pd.DataFrame(columns=DAILY_COLS)
@@ -406,7 +411,10 @@ def _cell(
     if row is None:
         if first is None or date < first or date > today:
             return cell
-        cell["state"] = PENDING if (last is not None and date > last) else NO_DATA
+        if market_calendar.is_holiday(date=date):
+            cell["state"] = CLOSED
+        else:
+            cell["state"] = PENDING if (last is not None and date > last) else NO_DATA
         return cell
 
     cell.update(details.get(date, {}))
@@ -422,17 +430,17 @@ def _cell(
         state=state(pnl=float(row["pnl"])),
     )
     cell["step"] = tint_step(ret=ret) if cell["state"] != FLAT else 0
-    # More than a weekend between the two closes: a hole in the data, so the
-    # figure covers several trading days.
+    # More than a weekend or a holiday between the two closes: a hole in the
+    # data, so the figure covers several trading days.
     cell["gap"] = _trading_days_between(start=row["prev_date"], end=date) > 0
     return cell
 
 
 def _trading_days_between(*, start: dt.date, end: dt.date) -> int:
-    """Weekdays strictly between two dates."""
+    """Trading days (weekdays that are not market holidays) strictly between two dates."""
     count, day = 0, start + dt.timedelta(days=1)
     while day < end:
-        if day.weekday() < WEEKDAYS:
+        if day.weekday() < WEEKDAYS and not market_calendar.is_holiday(date=day):
             count += 1
         day += dt.timedelta(days=1)
     return count
@@ -444,11 +452,12 @@ def month_weeks(
     """The month as calendar rows: ``{"days": [5 cells, Mon..Fri], "summary": {...}}``.
 
     Each cell has ``date``, ``state`` (gain / loss / flat / nodata / pending /
-    empty), ``step`` (tint strength), ``ret``, ``pnl``, ``nav``, ``prev_nav``,
-    ``prev_date``, ``flow``, ``gap`` and the ``day_details`` fields. A weekday
-    inside the covered range with no close is ``nodata``; one after the last
-    close, up to today, is ``pending``; days outside the month, before the first
-    close or in the future are ``empty``. ``summary`` covers the week's days
+    closed / empty), ``step`` (tint strength), ``ret``, ``pnl``, ``nav``,
+    ``prev_nav``, ``prev_date``, ``flow``, ``gap`` and the ``day_details``
+    fields. A market holiday inside the covered range is ``closed``; any other
+    weekday there with no close is ``nodata``; one after the last close, up to
+    today, is ``pending``; days outside the month, before the first close or in
+    the future are ``empty``. ``summary`` covers the week's days
     that belong to the month.
     """
     records = [] if daily is None or daily.empty else daily.to_dict("records")

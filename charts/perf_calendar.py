@@ -65,12 +65,14 @@ OPEN_KEY_PREFIX = "perf_open_"
 # The line of a month row: drawn in a fixed box and stretched to the width the
 # row gives it, so every row is the same height. ``LABEL_BAND_PX`` is the room
 # above and below that box for the day labels; under ``LABELS_MIN_WIDTH_PX`` of
-# chart the labels would run into each other and are not shown. ``_SPARK_PAD`` keeps the stroke
-# inside the box at the top and bottom, ``_SPARK_MARGIN`` keeps the end dot
-# inside it at the sides (an image clips what leaves its box).
-SPARK_HEIGHT_PX = 36
-LABEL_BAND_PX = 13
-LABELS_MIN_WIDTH_PX = 620
+# chart a day is too narrow a slot (the box holds 31 of them) and labels on
+# neighbouring days would run into each other, so they are not shown.
+# ``_SPARK_PAD`` keeps the stroke inside the box at the top and bottom,
+# ``_SPARK_MARGIN`` keeps the end dot inside it at the sides (an image clips
+# what leaves its box).
+SPARK_HEIGHT_PX = 44
+LABEL_BAND_PX = 15
+LABELS_MIN_WIDTH_PX = 880
 _SPARK_WIDTH, _SPARK_HEIGHT, _SPARK_PAD, _SPARK_MARGIN = 100.0, 40.0, 4.0, 3.0
 _SPARK_STROKE = {performance.GAIN: GAIN_INK, performance.LOSS: LOSS_INK}
 # The box is stretched to the row's width; this keeps a stroke its own width.
@@ -139,6 +141,7 @@ _PERF_CSS = f"""
 .perfcal-legend .scale b {{ font-weight: 500; margin: 0 5px; }}
 .perfcal-legend .sw-nodata {{ background: repeating-linear-gradient(135deg, var(--hatch) 0 3px, transparent 3px 6px); }}
 .perfcal-legend .sw-pending {{ box-shadow: none; outline: 1px dashed var(--line-strong); outline-offset: -1px; }}
+.perfcal-legend .sw-closed {{ background: var(--surface-2); box-shadow: none; }}
 .perfcal-legend .sw-flow {{ width: 9px; height: 9px; border-radius: 50%; box-shadow: inset 0 0 0 2px var(--accent); }}
 .perfcal-legend .sw-line {{ width: 18px; height: 2px; border-radius: 1px; box-shadow: none; background: var(--ink-2); }}
 .perfcal-legend .sw-zero {{ width: 18px; height: 0; border-radius: 0; box-shadow: none;
@@ -165,6 +168,7 @@ _PERF_CSS = f"""
 .perftile.empty {{ border-color: transparent; background: none; }}
 .perftile.nodata {{ background-image: repeating-linear-gradient(135deg, var(--hatch) 0 6px, transparent 6px 12px); }}
 .perftile.pending {{ border-style: dashed; border-color: var(--line-strong); }}
+.perftile.closed {{ border-color: transparent; background-color: var(--surface-2); }}
 .perftile.week {{ background-color: var(--surface-2); }}
 .perftile.week .pct {{ font-size: 14px; margin-top: 21px; }}
 .perftile .flow {{ position: absolute; top: 7px; right: 9px; width: 8px; height: 8px; border-radius: 50%;
@@ -221,8 +225,8 @@ _PERF_CSS = f"""
 /* The padding is the hover area; the offsets take it back, so the text stays where it was. */
 .perfyear .lbl {{ position: absolute; font-size: 10px; line-height: 1; white-space: nowrap;
   color: var(--ink-2); padding: 3px 4px; pointer-events: auto; cursor: default; }}
-.perfyear .lbl.above {{ transform: translate(-50%, calc(-100% - 1px)); }}
-.perfyear .lbl.below {{ transform: translate(-50%, 2px); }}
+.perfyear .lbl.above {{ transform: translate(-50%, calc(-100% - 3px)); }}
+.perfyear .lbl.below {{ transform: translate(-50%, 4px); }}
 .perfyear .lbl:hover {{ color: var(--ink); font-weight: 650; z-index: 40; }}
 /* The hovered day's date, over the label. */
 .perfyear .lbl:hover::after {{ content: attr(data-date); position: absolute; left: 50%;
@@ -323,6 +327,7 @@ def legend_html(*, dark: bool) -> str:
         f'<b>{_UP} +{top:g}% or more</b></span>'
         '<span><i class="sw-nodata"></i>No data</span>'
         '<span><i class="sw-pending"></i>Pending (no close yet)</span>'
+        '<span><i class="sw-closed"></i>Market holiday</span>'
         '<span><i class="sw-flow"></i>Deposit or withdrawal</span>'
         '<span>Weekends are not shown: markets are closed.</span>'
         "</div>"
@@ -336,7 +341,8 @@ def rows_legend_html(*, dark: bool) -> str:
         '<span><i class="sw-line"></i>Return since the month\'s start, day by day</span>'
         '<span><i class="sw-zero"></i>Month\'s start (0%)</span>'
         '<span>Numbers: each day\'s own return, in percent</span>'
-        '<span>Days without a close are skipped. Each row has its own scale.</span>'
+        '<span>Each day sits at its date, so the rows line up. Days without a close have no point.</span>'
+        '<span>All rows share one scale.</span>'
         "</div>"
     ))
 
@@ -416,6 +422,8 @@ def day_tile_html(*, cell: dict, currency: str | None, position: str, dark: bool
         return _root(dark=dark, body=f'<div class="perftile nodata">{number}<div class="note">no data</div></div>')
     if state == performance.PENDING:
         return _root(dark=dark, body=f'<div class="perftile pending">{number}<div class="note">pending</div></div>')
+    if state == performance.CLOSED:
+        return _root(dark=dark, body=f'<div class="perftile closed">{number}<div class="note">market closed</div></div>')
 
     classes = " ".join(
         part for part in ("perftile", state, _tint_class(state=state, step=cell["step"]), position) if part
@@ -444,7 +452,7 @@ def week_tile_html(*, summary: dict, dark: bool) -> str:
 def _line_days(*, month: dict) -> list[dict]:
     """The month's days that the line draws: those with a return, in day order.
     A day with no close (a holiday, a day before the account's first close, a
-    day still to come) has nothing to draw and takes no place on the line."""
+    day still to come) has nothing to draw and gets no point."""
     return [cell for week in month["weeks"] for cell in week["days"]
             if cell["date"].month == month["month"] and has_result(cell=cell) and cell["ret"] is not None]
 
@@ -452,19 +460,34 @@ def _line_days(*, month: dict) -> list[dict]:
 def month_line(*, month: dict) -> list[tuple[float, float]]:
     """The month's running return as ``(x, value)`` points, in day order.
 
-    The line starts at ``(0, 0)`` and has one point per day with a return,
-    evenly spaced up to ``x = 1``: days without a close are skipped, they do
-    not leave a hole. ``value`` links the daily returns (``prod(1 + r) - 1``),
-    so the last one is the month's return. A month with no such day gives no
-    points.
+    ``x`` is the day's date as a share of the month (day / days in month), so a
+    date sits at the same place in every row and a month still running ends
+    part way. The line starts at 0 at the close it is measured from: the end
+    of the previous month (``x = 0``), or the day before the first result when
+    the account's data starts inside the month. ``value`` links the daily
+    returns (``prod(1 + r) - 1``), so the last one is the month's return. A
+    month with no such day gives no points.
     """
     days = _line_days(month=month)
-    points: list[tuple[float, float]] = [(0.0, 0.0)] if days else []
+    if not days:
+        return []
+    length = _calendar.monthrange(month["year"], month["month"])[1]
+    before = days[0]["prev_date"]
+    start = before.day / length if before is not None and before.month == month["month"] else 0.0
+    points: list[tuple[float, float]] = [(start, 0.0)]
     linked = 1.0
-    for index, cell in enumerate(days, start=1):
+    for cell in days:
         linked *= 1.0 + cell["ret"]
-        points.append((index / len(days), linked - 1.0))
+        points.append((cell["date"].day / length, linked - 1.0))
     return points
+
+
+def period_scale(*, months: list[dict]) -> tuple[float, float]:
+    """The lowest and highest running return over every month's line, 0
+    included: the one vertical scale all the rows of a period are drawn on, so
+    a big month looks bigger than a small one."""
+    values = [value for month in months for _, value in month_line(month=month)]
+    return min([0.0, *values]), max([0.0, *values])
 
 
 def fmt_day_label(*, ret: float) -> str:
@@ -475,10 +498,12 @@ def fmt_day_label(*, ret: float) -> str:
     return f"{'+' if ret > 0 else _MINUS}{text}"
 
 
-def _spark_coords(*, points: list[tuple[float, float]]) -> tuple[float, list[tuple[float, float]]]:
-    """The zero rule's y and the points of ``month_line``, in the line box's units."""
-    values = [value for _, value in points]
-    low, high = min([0.0, *values]), max([0.0, *values])
+def _spark_coords(
+    *, points: list[tuple[float, float]], scale: tuple[float, float],
+) -> tuple[float, list[tuple[float, float]]]:
+    """The zero rule's y and the points of ``month_line``, in the line box's
+    units; ``scale`` is the (low, high) value range the box's height spans."""
+    low, high = scale
     span = high - low
     drawable = _SPARK_HEIGHT - 2 * _SPARK_PAD
 
@@ -490,17 +515,18 @@ def _spark_coords(*, points: list[tuple[float, float]]) -> tuple[float, list[tup
     return y_of(value=0.0), [(x * _SPARK_WIDTH, y_of(value=value)) for x, value in points]
 
 
-def spark_svg(*, month: dict, dark: bool) -> tuple[str, str, str]:
+def spark_svg(*, month: dict, scale: tuple[float, float], dark: bool) -> tuple[str, str, str]:
     """The month's line over a dashed zero rule, as a standalone SVG.
 
     Returns ``(svg, kind, label)``: ``kind`` is the direction the line ends in
     (empty when the month has no line) and ``label`` says where it ends, for
     the image's alt text. Colours are written into the SVG: it is shown as an
-    image, which does not see the page's stylesheet.
+    image, which does not see the page's stylesheet. ``scale`` is
+    ``period_scale``.
     """
     theme = "dark" if dark else "light"
     points = month_line(month=month)
-    zero, coords = _spark_coords(points=points)
+    zero, coords = _spark_coords(points=points, scale=scale)
     parts = [f'<path class="zero" d="M0 {zero:.2f} H{_SPARK_WIDTH:g}" stroke="{LINE_STRONG[theme]}" '
              f'stroke-width="1" stroke-dasharray="3 3" {_NON_SCALING}/>']
     kind, label = "", "no results"
@@ -526,17 +552,41 @@ def spark_svg(*, month: dict, dark: bool) -> tuple[str, str, str]:
     return svg, kind, label
 
 
-def day_labels(*, month: dict) -> list[dict]:
+# Box units under which a point counts as on its neighbours' chord.
+_LABEL_SIDE_EPSILON = 0.01
+
+
+def _label_side(*, coords: list[tuple[float, float]], index: int, ret: float) -> str:
+    """Which side of point ``coords[index]`` its label goes: the side the line
+    bends away from, so neither segment at the point runs through the text.
+
+    The point is compared with the straight line between its neighbours, taken
+    at the point's x (the last point has one neighbour: level with it). Above
+    that chord the line is a peak there and the label goes above; below it, a
+    valley, and the label goes below. On the chord, the day's sign decides.
+    """
+    x, y = coords[index]
+    prev_x, prev_y = coords[index - 1]
+    if index + 1 < len(coords):
+        next_x, next_y = coords[index + 1]
+        chord = prev_y + (next_y - prev_y) * (x - prev_x) / (next_x - prev_x)
+    else:
+        chord = prev_y
+    if abs(y - chord) < _LABEL_SIDE_EPSILON:
+        return "below" if ret < 0 else "above"
+    return "above" if y < chord else "below"
+
+
+def day_labels(*, month: dict, scale: tuple[float, float]) -> list[dict]:
     """One label per day on the line: ``{"date", "text", "left", "top", "side"}``.
 
     ``text`` is that day's own return (the line's height is the running one).
     ``left`` is a percent of the chart's width and ``top`` is pixels down the
     line's box: the image is stretched sideways only, so text over it cannot
-    be part of it. ``side`` puts the label above the point on a day that did
-    not lose and below it on a day that did, away from the line it came along.
+    be part of it. ``side`` is ``_label_side``. ``scale`` is ``period_scale``.
     """
     days = _line_days(month=month)
-    _, coords = _spark_coords(points=month_line(month=month))
+    _, coords = _spark_coords(points=month_line(month=month), scale=scale)
     full = _SPARK_WIDTH + 2 * _SPARK_MARGIN
     return [
         {
@@ -544,23 +594,23 @@ def day_labels(*, month: dict) -> list[dict]:
             "text": fmt_day_label(ret=cell["ret"]),
             "left": (x + _SPARK_MARGIN) / full * 100,
             "top": y / _SPARK_HEIGHT * SPARK_HEIGHT_PX,
-            "side": "below" if cell["ret"] < 0 else "above",
+            "side": _label_side(coords=coords, index=index, ret=cell["ret"]),
         }
-        for cell, (x, y) in zip(days, coords[1:])
+        for index, (cell, (x, y)) in enumerate(zip(days, coords[1:]), start=1)
     ]
 
 
-def _spark(*, month: dict, dark: bool) -> str:
+def _spark(*, month: dict, scale: tuple[float, float], dark: bool) -> str:
     """The month's line as an image, with each day's return written at its
     point. Hovering a return shows that day's date."""
-    svg, kind, label = spark_svg(month=month, dark=dark)
+    svg, kind, label = spark_svg(month=month, scale=scale, dark=dark)
     name = f"{_calendar.month_name[month['month']]} {month['year']}"
     data = base64.b64encode(svg.encode()).decode()
     labels = "".join(
         f'<span class="lbl {item["side"]}" data-date="{fmt_weekday_date(date=item["date"])}" '
         f'style="left:{item["left"]:.2f}%;top:{item["top"]:.1f}px">'
         f'{html.escape(item["text"])}</span>'
-        for item in day_labels(month=month)
+        for item in day_labels(month=month, scale=scale)
     )
     return (
         '<div class="chart">'
@@ -570,11 +620,12 @@ def _spark(*, month: dict, dark: bool) -> str:
     )
 
 
-def month_row_html(*, month: dict, dark: bool) -> str:
+def month_row_html(*, month: dict, scale: tuple[float, float], dark: bool) -> str:
     """One month as a row: its name, the running return as a line, then the
     month's return, money and fees.
 
-    ``month`` is one item of ``performance.period_months``.
+    ``month`` is one item of ``performance.period_months``; ``scale`` is
+    ``period_scale`` of all the rows shown with it.
     """
     summary = month["summary"]
     if summary["days"]:
@@ -587,5 +638,5 @@ def month_row_html(*, month: dict, dark: bool) -> str:
     return _root(dark=dark, body=(
         '<div class="perfyear"><div class="month">'
         f'<div class="name">{_calendar.month_name[month["month"]]} {month["year"]}</div>'
-        f'{_spark(month=month, dark=dark)}{totals}{fees}</div></div>'
+        f'{_spark(month=month, scale=scale, dark=dark)}{totals}{fees}</div></div>'
     ))

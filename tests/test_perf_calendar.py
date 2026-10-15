@@ -88,6 +88,18 @@ def test_no_data_pending_and_empty_tiles(daily, week):
     assert '<div class="perftile empty"></div>' in _tile(second["days"][2])   # 11 Mar: the future
 
 
+def test_market_holiday_tile():
+    """Good Friday, 3 April 2026: the market is closed, which is not missing data."""
+    closes = pd.DataFrame([{"date": D(2026, 4, 2), "nav": 1000.0}, {"date": D(2026, 4, 3), "nav": 1000.1},
+                           {"date": D(2026, 4, 6), "nav": 1010.0}], columns=["date", "nav"])
+    weeks = performance.month_weeks(daily=performance.daily(closes=closes, flows={}), details={},
+                                    year=2026, month=4, today=D(2026, 4, 6))
+    friday = weeks[0]["days"][4]
+    assert friday["date"] == D(2026, 4, 3) and not perf_calendar.has_result(cell=friday)
+    assert ('<div class="perftile closed"><div class="num">3</div><div class="note">market closed</div></div>'
+            in _tile(friday))
+
+
 def test_only_days_with_a_close_open_details(daily, week):
     second = performance.month_weeks(daily=daily, details={}, year=2026, month=3, today=TODAY)[1]
     assert [perf_calendar.has_result(cell=c) for c in week["days"]] == [True, True, True, False, True]
@@ -167,7 +179,7 @@ def test_currency_is_escaped(week):
 
 def test_legend_names_every_state():
     legend = perf_calendar.legend_html(dark=False)
-    for text in ("No data", "Pending", "Deposit or withdrawal", "Weekends are not shown",
+    for text in ("No data", "Pending", "Market holiday", "Deposit or withdrawal", "Weekends are not shown",
                  "+1.5% or more", "−1.5% or more"):
         assert text in legend
 
@@ -182,7 +194,7 @@ def year(daily) -> list[dict]:
 
 
 def _svg(month: dict) -> str:
-    return perf_calendar.spark_svg(month=month, dark=False)[0]
+    return perf_calendar.spark_svg(month=month, scale=perf_calendar.period_scale(months=[month]), dark=False)[0]
 
 
 def _path(svg: str, name: str) -> str:
@@ -204,7 +216,7 @@ def _image_svg(row: str) -> str:
 
 
 def test_month_row_shows_line_and_totals(year):
-    march = perf_calendar.month_row_html(month=year[2], dark=False)
+    march = perf_calendar.month_row_html(month=year[2], scale=perf_calendar.period_scale(months=year), dark=False)
     assert '<div class="name">March 2026</div>' in march
     assert march.count("<img") == 1 and 'class="sq' not in march
     assert 'alt="March 2026 running return: ends at +0.17%"' in march
@@ -216,7 +228,7 @@ def test_month_row_shows_line_and_totals(year):
 
 def test_month_row_is_one_grid_line_in_reading_order(year):
     """Name, line, return, money, fees: one row, columns set once in the stylesheet."""
-    march = perf_calendar.month_row_html(month=year[2], dark=False)
+    march = perf_calendar.month_row_html(month=year[2], scale=perf_calendar.period_scale(months=year), dark=False)
     order = [march.index(mark) for mark in ('class="name"', "<img", 'class="pct"', 'class="money"',
                                             'class="fees"')]
     assert order == sorted(order)
@@ -227,15 +239,15 @@ def test_line_is_an_image_because_st_html_removes_inline_svg(year):
     """st.html sanitizes with the HTML profile only: an inline <svg> never reaches
     the page. The line must travel as an image, and that image must be the line."""
     for dark in (False, True):
-        march = perf_calendar.month_row_html(month=year[2], dark=dark)
+        march = perf_calendar.month_row_html(month=year[2], scale=perf_calendar.period_scale(months=year), dark=dark)
         assert "<svg" not in march and "<path" not in march
-        assert _image_svg(march) == perf_calendar.spark_svg(month=year[2], dark=dark)[0]
+        assert _image_svg(march) == perf_calendar.spark_svg(month=year[2], scale=perf_calendar.period_scale(months=year), dark=dark)[0]
 
 
 def test_line_image_carries_its_own_colours(year):
     """An image does not see the page's CSS variables."""
     for dark, theme in ((False, "light"), (True, "dark")):
-        svg = perf_calendar.spark_svg(month=year[2], dark=dark)[0]
+        svg = perf_calendar.spark_svg(month=year[2], scale=perf_calendar.period_scale(months=year), dark=dark)[0]
         assert "var(" not in svg and "class=\"spark" not in svg
         assert f'stroke="{perf_calendar.GAIN_INK[theme]}"' in svg
         assert f'stroke="{perf_calendar.LINE_STRONG[theme]}"' in svg
@@ -256,25 +268,54 @@ def test_month_line_links_the_daily_returns(year):
     assert values[-1] == pytest.approx(year[2]["summary"]["ret"])
 
 
-def test_month_line_skips_days_without_a_close(year):
-    """March has closes on the 2nd, 3rd, 4th, 6th and 9th. The 5th (no data) and
-    the days after the 9th take no place: five days, evenly spaced, edge to edge."""
+def test_month_line_places_each_day_at_its_date(year):
+    """March has closes on the 2nd, 3rd, 4th, 6th and 9th: each sits at its date
+    out of 31, so a date is at the same place in every row. The 5th (no data)
+    has no point, and the month still running ends part way, not at the edge."""
     xs = [x for x, _ in perf_calendar.month_line(month=year[2])]
-    assert xs == pytest.approx([0, 0.2, 0.4, 0.6, 0.8, 1.0])
+    assert xs == pytest.approx([0, 2 / 31, 3 / 31, 4 / 31, 6 / 31, 9 / 31])
+
+
+def test_month_line_starts_at_the_close_it_is_measured_from():
+    """Data that starts inside the month: the line starts at the first close
+    (the 3rd), not at the month's left edge."""
+    closes = pd.DataFrame([{"date": D(2026, 3, 3), "nav": 1000.0}, {"date": D(2026, 3, 4), "nav": 1010.0}],
+                          columns=["date", "nav"])
+    month = performance.period_months(daily=performance.daily(closes=closes, flows={}), details={}, fees={},
+                                      today=D(2026, 3, 4), months=[(2026, 3)])[0]
+    line = perf_calendar.month_line(month=month)
+    assert [value for point in line for value in point] == pytest.approx([3 / 31, 0.0, 4 / 31, 0.01])
+
+
+def test_rows_share_one_scale():
+    """A 1% month is drawn smaller than a 10% month: both on the period's scale."""
+    small, big = _one_day_month(0.01), _one_day_month(0.10)
+    scale = perf_calendar.period_scale(months=[small, big])
+    assert scale == pytest.approx((0.0, 0.10))
+    top = {}
+    for name, month in (("small", small), ("big", big)):
+        svg = perf_calendar.spark_svg(month=month, scale=scale, dark=False)[0]
+        top[name] = _numbers(_path(svg, "line"))[-1]
+    assert top["big"] < top["small"]                     # SVG y grows downward
+    assert top["big"] == pytest.approx(4.0)              # the period's top is the box's top
+    assert perf_calendar.period_scale(months=[_one_day_month(-0.03), big]) == pytest.approx((-0.03, 0.10))
 
 
 def test_day_labels_give_each_days_own_return(year):
     """One label per day on the line, at that day's point; the text is the day's
     return, not the running one the line's height shows."""
-    labels = perf_calendar.day_labels(month=year[2])
+    labels = perf_calendar.day_labels(month=year[2], scale=perf_calendar.period_scale(months=year))
     assert [item["date"] for item in labels] == [D(2026, 3, day) for day in (2, 3, 4, 6, 9)]
     # 2 Mar +1.00%, 3 Mar 12 on 1,210, 4 Mar flat, 6 Mar 1,222 -> 1,200, and 9 Mar
     # 1,200 -> 1,300 is the 100 deposited on Saturday the 7th: no gain.
     assert [item["text"] for item in labels] == ["+1.0", "+1.0", "0.0", "−1.8", "0.0"]
-    assert [item["side"] for item in labels] == ["above", "above", "above", "below", "above"]
-    # Left is a percent of the image's width, margin included; the last day is its right end.
+    # The side the line bends away from: the 2nd is under the chord from the
+    # start to the 3rd (the line steepens), the 3rd and 4th are on the plateau's
+    # top, the 6th is the fall's bottom, and the 9th, level with it, goes by sign.
+    assert [item["side"] for item in labels] == ["below", "above", "above", "below", "above"]
+    # Left is a percent of the image's width, margin included; a day sits at its date.
     assert [item["left"] for item in labels] == pytest.approx(
-        [(x * 100 + 3) / 106 * 100 for x in (0.2, 0.4, 0.6, 0.8, 1.0)])
+        [(day / 31 * 100 + 3) / 106 * 100 for day in (2, 3, 4, 6, 9)])
     assert all(0 <= item["top"] <= perf_calendar.SPARK_HEIGHT_PX for item in labels)
     # The label sits on its point: same height as the line there, scaled to pixels.
     ys = _numbers(_path(_svg(year[2]), "line"))[1::2]
@@ -294,14 +335,14 @@ def test_fmt_day_label(ret, text):
 
 
 def test_month_row_writes_the_day_labels_over_the_line(year):
-    march = perf_calendar.month_row_html(month=year[2], dark=False)
+    march = perf_calendar.month_row_html(month=year[2], scale=perf_calendar.period_scale(months=year), dark=False)
     assert march.count('<span class="lbl ') == 5
     assert '<span class="lbl below" data-date="Fri 06-03-2026" style="left:' in march
     assert ">−1.8</span>" in march
     # Each label carries its own day for the hover text.
     assert [part.split('"')[0] for part in march.split('data-date="')[1:]] == [
         "Mon 02-03-2026", "Tue 03-03-2026", "Wed 04-03-2026", "Fri 06-03-2026", "Mon 09-03-2026"]
-    june = perf_calendar.month_row_html(month=year[5], dark=False)
+    june = perf_calendar.month_row_html(month=year[5], scale=perf_calendar.period_scale(months=year), dark=False)
     assert '<div class="lbls"></div>' in june                   # no days, no labels
     css = perf_calendar.styles_html()
     # The date shows on hover; the chart is over the row's button but only a label takes the pointer.
@@ -327,7 +368,7 @@ def test_line_is_drawn_inside_its_box(year):
     assert "nan" not in line and "inf" not in line
     numbers = _numbers(line)
     xs, ys = numbers[0::2], numbers[1::2]
-    assert len(xs) == 6 and xs == sorted(xs) and (xs[0], xs[-1]) == (0.0, 100.0)
+    assert len(xs) == 6 and xs == sorted(xs) and xs[0] == 0.0 and xs[-1] == pytest.approx(900 / 31, abs=0.01)
     assert all(0 <= x <= 100 for x in xs) and all(0 <= y <= 40 for y in ys)
     # The line starts on the zero rule and the dot sits on its last point.
     assert ys[0] == _numbers(_path(march, "zero"))[1]
@@ -336,8 +377,8 @@ def test_line_is_drawn_inside_its_box(year):
 
 def test_line_colour_follows_the_return_not_the_money(year):
     """March ends at +0.17% on 0.00 of money: the line ends above zero, so it is a gain."""
-    assert '<img class="spark gain"' in perf_calendar.month_row_html(month=year[2], dark=False)
-    assert perf_calendar.spark_svg(month=year[2], dark=False)[1] == performance.GAIN
+    assert '<img class="spark gain"' in perf_calendar.month_row_html(month=year[2], scale=perf_calendar.period_scale(months=year), dark=False)
+    assert perf_calendar.spark_svg(month=year[2], scale=perf_calendar.period_scale(months=year), dark=False)[1] == performance.GAIN
 
 
 def _one_day_month(ret: float) -> dict:
@@ -356,9 +397,10 @@ def _one_day_month(ret: float) -> dict:
 ])
 def test_line_class_and_colour_per_direction(ret, kind, colours):
     month = _one_day_month(ret)
-    assert f'<img class="{kind}"' in perf_calendar.month_row_html(month=month, dark=False)
+    scale = perf_calendar.period_scale(months=[month])
+    assert f'<img class="{kind}"' in perf_calendar.month_row_html(month=month, scale=scale, dark=False)
     assert f'stroke="{colours["light"]}" stroke-width="2"' in _svg(month)
-    assert f'stroke="{colours["dark"]}" stroke-width="2"' in perf_calendar.spark_svg(month=month, dark=True)[0]
+    assert f'stroke="{colours["dark"]}" stroke-width="2"' in perf_calendar.spark_svg(month=month, scale=scale, dark=True)[0]
 
 
 def test_flat_month_draws_a_level_line_on_the_zero_rule():
@@ -375,21 +417,21 @@ def test_loss_line_ends_below_the_zero_rule():
 
 
 def test_month_row_shows_the_months_fees(year):
-    march = perf_calendar.month_row_html(month=year[2], dark=False)
+    march = perf_calendar.month_row_html(month=year[2], scale=perf_calendar.period_scale(months=year), dark=False)
     assert '<div class="fees"><span>Fees</span><span>2.50</span></div>' in march
-    june = perf_calendar.month_row_html(month=year[5], dark=False)
+    june = perf_calendar.month_row_html(month=year[5], scale=perf_calendar.period_scale(months=year), dark=False)
     assert '<div class="fees"><span>Fees</span><span>0.00</span></div>' in june
 
 
 def test_month_row_without_results(year):
-    june = perf_calendar.month_row_html(month=year[5], dark=True)
+    june = perf_calendar.month_row_html(month=year[5], scale=perf_calendar.period_scale(months=year), dark=True)
     assert '<div class="perfcal-root dark">' in june
     assert "no results" in june
 
 
 def test_month_without_results_has_the_zero_rule_only(year):
-    june = perf_calendar.month_row_html(month=year[5], dark=False)
-    svg, kind, label = perf_calendar.spark_svg(month=year[5], dark=False)
+    june = perf_calendar.month_row_html(month=year[5], scale=perf_calendar.period_scale(months=year), dark=False)
+    svg, kind, label = perf_calendar.spark_svg(month=year[5], scale=perf_calendar.period_scale(months=year), dark=False)
     assert '<img class="spark"' in june and 'running return: no results"' in june
     assert 'class="zero"' in svg and 'class="line"' not in svg and 'class="end"' not in svg
     assert (kind, label) == ("", "no results")
@@ -397,14 +439,15 @@ def test_month_without_results_has_the_zero_rule_only(year):
 
 def test_month_rows_are_all_the_same_height(year):
     """Every row holds one line box, and the stylesheet gives that box a fixed height."""
-    assert {perf_calendar.month_row_html(month=month, dark=False).count("<img") for month in year} == {1}
+    assert {perf_calendar.month_row_html(month=month, scale=perf_calendar.period_scale(months=year), dark=False).count("<img")
+            for month in year} == {1}
     assert (f".perfyear .spark {{ display: block; width: 100%; height: {perf_calendar.SPARK_HEIGHT_PX}px;"
             in perf_calendar.styles_html())
 
 
 def test_line_carries_no_tooltip_under_the_click_target(year):
     """The whole row is one button, so a tooltip on the line could never show."""
-    march = perf_calendar.month_row_html(month=year[2], dark=False)
+    march = perf_calendar.month_row_html(month=year[2], scale=perf_calendar.period_scale(months=year), dark=False)
     assert "title=" not in march and "<title" not in _image_svg(march)
 
 
@@ -412,7 +455,7 @@ def test_rows_legend_explains_the_line():
     legend = perf_calendar.rows_legend_html(dark=True)
     assert legend.startswith('<div class="perfcal-root dark">')
     for text in ("Return since the month's start", "Month's start (0%)", "each day's own return",
-                 "Days without a close are skipped", "own scale"):
+                 "Each day sits at its date", "Days without a close have no point", "share one scale"):
         assert text in legend
 
 
