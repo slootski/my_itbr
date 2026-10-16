@@ -721,15 +721,44 @@ def test_perf_fee_text_names_each_kind_that_charged():
 
 def test_daily_table_fees_filter_counts_the_days_it_shows(smoke_app):
     """The statement's two December closes have no fee (its one trade is in June)."""
-    import app
+    from charts import perf_calendar
 
     at, _ = smoke_app
     at.run()
     assert not at.exception, f"app raised: {[e.value for e in at.exception]}"
     assert any(c.value == "2 of 2 days" for c in at.caption)
-    at.toggle(key=app.PERF_FEES_ONLY_KEY).set_value(True).run()
+    at.toggle(key=perf_calendar.FEES_ONLY_KEY).set_value(True).run()
     assert not at.exception, f"app raised: {[e.value for e in at.exception]}"
     assert any(c.value == "0 of 2 days" for c in at.caption)
+
+
+def test_fees_card_opens_the_daily_table_on_fee_days(smoke_app):
+    """The page script clicks the hidden button on a double click on the Fees
+    card. By default the table is closed and shows every day."""
+    from charts import perf_calendar
+
+    at, _ = smoke_app
+    at.run()
+    assert not at.exception, f"app raised: {[e.value for e in at.exception]}"
+    assert at.toggle(key=perf_calendar.FEES_ONLY_KEY).value is False
+    table = next(e for e in at.expander if e.label == "Daily table")
+    assert not table.proto.expanded
+
+    at.button(key=perf_calendar.FEES_OPEN_KEY).click().run()
+    assert not at.exception, f"app raised: {[e.value for e in at.exception]}"
+    assert at.toggle(key=perf_calendar.FEES_ONLY_KEY).value is True
+    assert next(e for e in at.expander if e.label == "Daily table").proto.expanded
+
+
+def test_fees_dblclick_script_targets_the_card_button_and_table():
+    from charts import perf_calendar
+
+    js = perf_calendar.fees_dblclick_js()
+    assert js.lstrip().startswith("<script>")
+    for key in (perf_calendar.FEES_CARD_KEY, perf_calendar.FEES_OPEN_KEY,
+                perf_calendar.TABLE_BOX_KEY, perf_calendar.FEES_ONLY_KEY):
+        assert f".st-key-{key}" in js
+    assert '"dblclick"' in js
 
 
 def test_perf_fee_text_without_fees_has_no_line():

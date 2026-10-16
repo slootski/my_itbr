@@ -58,6 +58,13 @@ WEEKDAY_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri")
 # ``st-key-<key>`` class): the metric row, a clickable day tile or month row,
 # and the button laid over each.
 METRICS_KEY = "perf_metrics"
+# Double-clicking the Fees card opens the daily table on the days with fees:
+# the card's box, the hidden button the page script clicks, and the table's box.
+FEES_CARD_KEY = "perf_fees_card"
+FEES_OPEN_KEY = "perf_fees_open"
+TABLE_BOX_KEY = "perf_daily_table_box"
+TABLE_EXPANDER_KEY = "perf_daily_table"
+FEES_ONLY_KEY = "perf_table_fees_only"
 DAY_KEY_PREFIX = "perf_day_"
 DAY_OPEN_KEY_PREFIX = "perf_dayopen_"
 ROW_KEY_PREFIX = "perf_row_"
@@ -151,6 +158,9 @@ _PERF_CSS = f"""
    none is cut off, and one height whether or not a card has a second line. */
 .st-key-{METRICS_KEY} [data-testid="stMetric"] {{ min-height: 7.2rem; }}
 .st-key-{METRICS_KEY} [data-testid="stMetricValue"] {{ font-size: 1.55rem; }}
+.st-key-{FEES_CARD_KEY} [data-testid="stMetric"] {{ cursor: pointer; user-select: none; }}
+.st-key-{FEES_CARD_KEY} [data-testid="stMetric"]:hover {{ border-color: var(--accent, #2a78d6); }}
+.st-key-{FEES_OPEN_KEY} {{ display: none; }}
 
 /* Month view: one tile per trading day, Mon..Fri, plus a Week total. */
 .perfhead {{ font-size: 11.5px; font-weight: 600; letter-spacing: 0.03em; text-transform: uppercase;
@@ -739,3 +749,43 @@ def daily_table_html(*, rows: list[dict], currency: str | None, dark: bool) -> s
     )
     return _root(dark=dark, body=f'<table class="perftable"><thead><tr>{head}</tr></thead>'
                                  f"<tbody>{body}</tbody></table>")
+
+
+# How long the page script waits for the table to open before it gives up.
+_SCROLL_WAIT_MS = 8000
+
+_FEES_DBLCLICK_JS = f"""
+<script>
+(() => {{
+  // Once per page: Streamlit draws this again on every rerun.
+  if (window.__perfFeesDblclick) return;
+  window.__perfFeesDblclick = true;
+  document.addEventListener("dblclick", (event) => {{
+    if (!event.target.closest(".st-key-{FEES_CARD_KEY}")) return;
+    const button = document.querySelector(".st-key-{FEES_OPEN_KEY} button");
+    if (!button) return;
+    window.getSelection()?.removeAllRanges();
+    button.click();
+    // The rerun opens the table with the filter on; then bring it into view.
+    const started = Date.now();
+    const timer = setInterval(() => {{
+      const box = document.querySelector(".st-key-{TABLE_BOX_KEY}");
+      const filtered = document.querySelector(".st-key-{FEES_ONLY_KEY} input:checked");
+      if (box && filtered && box.querySelector(".perftable, [data-testid='stCaptionContainer']")) {{
+        clearInterval(timer);
+        box.scrollIntoView({{ behavior: "smooth", block: "start" }});
+      }} else if (Date.now() - started > {_SCROLL_WAIT_MS}) {{
+        clearInterval(timer);
+      }}
+    }}, 100);
+  }});
+}})();
+</script>
+"""
+
+
+def fees_dblclick_js() -> str:
+    """Page script: a double click on the Fees card clicks the hidden
+    ``FEES_OPEN_KEY`` button, then scrolls to the daily table once it is open.
+    Streamlit has no double-click event, hence the script."""
+    return _FEES_DBLCLICK_JS

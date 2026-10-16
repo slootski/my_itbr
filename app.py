@@ -2325,10 +2325,20 @@ def _perf_metrics(
         border=True, help="Days that closed with a gain, out of the days with a close.",
     )
     fee_line, fee_help = _perf_fee_text(split=fee_split)
-    cols[5].metric(
+    cols[5].container(key=perf_calendar.FEES_CARD_KEY).metric(
         f"Fees ({currency})" if currency else "Fees", f"{fees:,.2f}", delta=fee_line,
-        delta_color="off", delta_arrow="off", border=True, help=fee_help,
+        delta_color="off", delta_arrow="off", border=True,
+        help=f"{fee_help}\n\nDouble-click the card to list the days with fees.",
     )
+    # Hidden; the page script clicks it on a double click on the Fees card.
+    st.button("Show days with fees", key=perf_calendar.FEES_OPEN_KEY, on_click=_open_fee_days)
+    st.html(perf_calendar.fees_dblclick_js(), unsafe_allow_javascript=True)
+
+
+def _open_fee_days() -> None:
+    """Open the daily table with only the days that had fees."""
+    st.session_state[perf_calendar.TABLE_EXPANDER_KEY] = True
+    st.session_state[perf_calendar.FEES_ONLY_KEY] = True
 
 
 _PERF_TABLE_INFO = (
@@ -2344,9 +2354,6 @@ _PERF_TABLE_INFO = (
     "\nAn empty cell means none that day. The first day has no close before it, so "
     "its P&L and Return show —. Hover a column name for its meaning."
 )
-PERF_FEES_ONLY_KEY = "perf_table_fees_only"
-
-
 def tab_performance(*, data: dict) -> None:
     st.subheader("Daily performance")
 
@@ -2491,14 +2498,16 @@ def tab_performance(*, data: dict) -> None:
             "date, so the rows line up, and all rows share one scale. Click a row to open "
             "that month."
         )
-    with st.expander("Daily table"):
+    with st.container(key=perf_calendar.TABLE_BOX_KEY), st.expander(
+        "Daily table", key=perf_calendar.TABLE_EXPANDER_KEY, on_change="rerun",
+    ):
         st.markdown(_PERF_TABLE_INFO)
         rows = performance.table_rows(
             daily=daily, fees=fees,
             fee_details=performance.fee_details(trades=data.get("trades"), cash_tx=data.get("cash_tx")),
             start=start, end=end,
         )
-        fees_only = st.toggle("Only days with fees", key=PERF_FEES_ONLY_KEY)
+        fees_only = st.toggle("Only days with fees", key=perf_calendar.FEES_ONLY_KEY)
         shown = [row for row in rows if abs(row["fees"]) >= performance.FLAT_EPSILON] if fees_only else rows
         st.caption(f"{len(shown)} of {len(rows)} days")
         if shown:
