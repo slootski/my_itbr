@@ -2340,60 +2340,11 @@ _PERF_TABLE_INFO = (
     "- **Return**: the P&L as a percent of the previous close plus that day's deposit.\n"
     "- **Deposits**: money added (+) or taken out (−) that day.\n"
     "- **Fees**: commissions and broker fees charged that day. They are already "
-    "inside the P&L.\n"
-    "- **Fee for**: what each fee was charged for: the trade (a currency conversion "
-    "such as USD.ILS has its own fee) or the broker fee.\n"
+    "inside the P&L. **Hover a fee** to see what it was for.\n"
     "\nAn empty cell means none that day. The first day has no close before it, so "
-    "its P&L and Return are empty."
+    "its P&L and Return show —. Hover a column name for its meaning."
 )
-
-
-def _perf_table(
-    *, daily: pd.DataFrame, fees: dict[dt.date, float], fee_notes: dict[dt.date, str],
-    start: dt.date, end: dt.date,
-) -> pd.DataFrame:
-    """The period's days as a plain table, newest first: the same numbers as the
-    calendar. Deposits and fees are None (an empty cell) on days without one."""
-    rows = daily[(daily["date"] >= start) & (daily["date"] <= end)].iloc[::-1]
-
-    def blank_zero(value: float) -> float | None:
-        return round(value, 2) if abs(value) >= performance.FLAT_EPSILON else None
-
-    return pd.DataFrame({
-        "Date": pd.to_datetime(rows["date"]).to_list(),
-        "Account value": rows["nav"].round(2).to_list(),
-        "P&L": pd.to_numeric(rows["pnl"]).round(2).to_list(),
-        "Return": (pd.to_numeric(rows["ret"]) * 100).round(2).to_list(),
-        "Deposits": [blank_zero(float(flow)) for flow in rows["flow"]],
-        "Fees": [blank_zero(fees.get(d, 0.0)) for d in rows["date"]],
-        "Fee for": [fee_notes.get(d) for d in rows["date"]],
-    })
-
-
-def _perf_table_config(*, currency: str | None) -> dict:
-    """Column formats and hover help for ``_perf_table``. The currency goes in
-    the money headers."""
-    unit = f" ({currency})" if currency else ""
-    return {
-        "Date": st.column_config.DateColumn(
-            "Date", format="ddd DD-MM-YYYY", help="The trading day. Monday is measured from Friday."),
-        "Account value": st.column_config.NumberColumn(
-            f"Account value{unit}", format="%.2f", help="Cash plus holdings at the day's close."),
-        "P&L": st.column_config.NumberColumn(
-            f"P&L{unit}", format="%+.2f",
-            help="Gain or loss since the previous close, deposits and withdrawals taken out."),
-        "Return": st.column_config.NumberColumn(
-            "Return", format="%+.2f%%",
-            help="P&L as a percent of the previous close plus the day's deposit."),
-        "Deposits": st.column_config.NumberColumn(
-            f"Deposits{unit}", format="%+.2f",
-            help="Money added (+) or taken out (−) that day. Empty: none."),
-        "Fees": st.column_config.NumberColumn(
-            f"Fees{unit}", format="%.2f",
-            help="Commissions and broker fees that day, already inside the P&L. Empty: none."),
-        "Fee for": st.column_config.TextColumn(
-            "Fee for", help="What each fee was charged for: the trade or the broker fee."),
-    }
+PERF_FEES_ONLY_KEY = "perf_table_fees_only"
 
 
 def tab_performance(*, data: dict) -> None:
@@ -2542,12 +2493,16 @@ def tab_performance(*, data: dict) -> None:
         )
     with st.expander("Daily table"):
         st.markdown(_PERF_TABLE_INFO)
-        st.dataframe(_perf_table(daily=daily, fees=fees,
-                                 fee_notes=performance.fee_notes(trades=data.get("trades"),
-                                                                 cash_tx=data.get("cash_tx")),
-                                 start=start, end=end),
-                     column_config=_perf_table_config(currency=currency),
-                     width="stretch", hide_index=True)
+        rows = performance.table_rows(
+            daily=daily, fees=fees,
+            fee_details=performance.fee_details(trades=data.get("trades"), cash_tx=data.get("cash_tx")),
+            start=start, end=end,
+        )
+        fees_only = st.toggle("Only days with fees", key=PERF_FEES_ONLY_KEY)
+        shown = [row for row in rows if abs(row["fees"]) >= performance.FLAT_EPSILON] if fees_only else rows
+        st.caption(f"{len(shown)} of {len(rows)} days")
+        if shown:
+            st.html(perf_calendar.daily_table_html(rows=shown, currency=currency, dark=dark))
 
 
 # ---- net worth --------------------------------------------------------------

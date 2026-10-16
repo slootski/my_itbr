@@ -395,7 +395,7 @@ def test_fees_split_without_asset_class_counts_as_trades():
     assert out[performance.FEE_FX]["count"] == 0
 
 
-def test_fee_notes_say_what_each_fee_was_for():
+def test_fee_details_say_what_each_fee_was_for():
     trades = pd.DataFrame([
         {"trade_date": D(2026, 5, 12), "asset_class": "CASH", "symbol": "USD.ILS", "side": "BUY",
          "quantity": 64.0, "commission": -3.4449},
@@ -404,21 +404,44 @@ def test_fee_notes_say_what_each_fee_was_for():
         {"trade_date": D(2026, 5, 13), "asset_class": "STK", "symbol": "PFE", "side": "SELL",
          "quantity": -5.0, "commission": -2.5},
         {"trade_date": D(2026, 5, 14), "asset_class": "STK", "symbol": "XOM", "side": "BUY",
-         "quantity": 1.0, "commission": 0.0},   # free: no note
+         "quantity": 1.0, "commission": 0.0},   # free: nothing to explain
     ])
     cash_tx = pd.DataFrame([
         {"type": "FEES", "symbol": "", "amount_base": -1.5, "report_date": D(2026, 5, 15)},
     ])
-    out = performance.fee_notes(trades=trades, cash_tx=cash_tx)
+    out = performance.fee_details(trades=trades, cash_tx=cash_tx)
     assert out == {
-        D(2026, 5, 12): "3.44: Buy 64 USD.ILS (currency conversion)",
-        D(2026, 5, 13): "2.50: Buy 10 KO; 2.50: Sell 5 PFE",
-        D(2026, 5, 15): "1.50: broker fee",
+        D(2026, 5, 12): [("Buy 64 USD.ILS (currency conversion)", pytest.approx(3.4449))],
+        D(2026, 5, 13): [("Buy 10 KO", 2.5), ("Sell 5 PFE", 2.5)],
+        D(2026, 5, 15): [("broker fee", 1.5)],
     }
 
 
-def test_fee_notes_empty_input():
-    assert performance.fee_notes(trades=None, cash_tx=None) == {}
+def test_fee_details_empty_input():
+    assert performance.fee_details(trades=None, cash_tx=None) == {}
+
+
+def test_table_rows_are_newest_first_and_carry_fees_and_their_details():
+    daily = pd.DataFrame([
+        {"date": D(2026, 3, 2), "nav": 1000.0, "prev_date": None, "prev_nav": None,
+         "flow": 0.0, "pnl": None, "ret": None},
+        {"date": D(2026, 3, 3), "nav": 1510.0, "prev_date": D(2026, 3, 2), "prev_nav": 1000.0,
+         "flow": 500.0, "pnl": 10.0, "ret": 10.0 / 1500.0},
+        {"date": D(2026, 3, 4), "nav": 1495.0, "prev_date": D(2026, 3, 3), "prev_nav": 1510.0,
+         "flow": 0.0, "pnl": -15.0, "ret": -15.0 / 1510.0},
+        {"date": D(2026, 4, 1), "nav": 1500.0, "prev_date": D(2026, 3, 4), "prev_nav": 1495.0,
+         "flow": 0.0, "pnl": 5.0, "ret": 5.0 / 1495.0},   # outside the period
+    ])
+    rows = performance.table_rows(
+        daily=daily, fees={D(2026, 3, 4): 2.5}, fee_details={D(2026, 3, 4): [("Buy 10 KO", 2.5)]},
+        start=D(2026, 3, 1), end=D(2026, 3, 31),
+    )
+    assert [r["date"] for r in rows] == [D(2026, 3, 4), D(2026, 3, 3), D(2026, 3, 2)]
+    assert rows[0]["fees"] == 2.5 and rows[0]["fee_details"] == [("Buy 10 KO", 2.5)]
+    assert rows[0]["state"] == performance.LOSS and rows[1]["state"] == performance.GAIN
+    assert rows[1]["flow"] == 500.0 and rows[1]["fees"] == 0.0 and rows[1]["fee_details"] == []
+    # The first close on record has nothing to compare with.
+    assert rows[2]["pnl"] is None and rows[2]["ret"] is None and rows[2]["state"] is None
 
 
 def test_fees_split_empty_input():

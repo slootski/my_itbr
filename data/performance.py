@@ -330,15 +330,36 @@ def fees_by_day(
     return out
 
 
-def fee_notes(
+def fee_details(
     *, trades: pd.DataFrame | None, cash_tx: pd.DataFrame | None,
-) -> dict[dt.date, str]:
-    """What each day's fees were charged for, in words, e.g. ``3.44: Buy 64
-    USD.ILS (currency conversion)``; several charges are joined with ``; ``."""
-    out: dict[dt.date, list[str]] = {}
+) -> dict[dt.date, list[tuple[str, float]]]:
+    """What each day's fees were charged for: ``[(what, cost), ...]`` per date,
+    e.g. ``("Buy 64 USD.ILS (currency conversion)", 3.44)``."""
+    out: dict[dt.date, list[tuple[str, float]]] = {}
     for date, _kind, cost, what in _fee_items(trades=trades, cash_tx=cash_tx):
-        out.setdefault(date, []).append(f"{cost:,.2f}: {what}")
-    return {date: "; ".join(notes) for date, notes in out.items()}
+        out.setdefault(date, []).append((what, cost))
+    return out
+
+
+def table_rows(
+    *, daily: pd.DataFrame, fees: dict[dt.date, float],
+    fee_details: dict[dt.date, list[tuple[str, float]]], start: dt.date, end: dt.date,
+) -> list[dict]:
+    """The period's days for the daily table, newest first: ``{"date", "nav",
+    "pnl", "ret", "flow", "fees", "fee_details", "state"}``. ``pnl`` and ``ret``
+    are None on the first close on record; ``state`` is ``GAIN`` / ``LOSS`` /
+    ``FLAT``, or None without a result."""
+    rows = daily[(daily["date"] >= start) & (daily["date"] <= end)]
+    out = []
+    for row in reversed(rows.to_dict("records")):
+        pnl = _num(value=row["pnl"])
+        out.append({
+            "date": row["date"], "nav": float(row["nav"]), "pnl": pnl, "ret": _num(value=row["ret"]),
+            "flow": float(row["flow"]), "fees": fees.get(row["date"], 0.0),
+            "fee_details": fee_details.get(row["date"], []),
+            "state": None if pnl is None else state(pnl=pnl),
+        })
+    return out
 
 
 def fees_split(

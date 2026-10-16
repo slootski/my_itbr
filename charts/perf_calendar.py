@@ -243,6 +243,37 @@ _PERF_CSS = f"""
 .perfyear .gain .arrow {{ color: var(--gain); }}
 .perfyear .loss .arrow {{ color: var(--loss); }}
 .perfyear .none {{ color: var(--muted); }}
+
+/* Daily table: one row per trading day. A fee cell opens a hover panel that
+   says what each fee was for; it opens upward on the last rows. */
+.perftable {{ width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }}
+.perftable th {{ font-size: 11.5px; font-weight: 600; letter-spacing: 0.03em; text-transform: uppercase;
+  color: var(--ink-2); text-align: right; padding: 6px 10px; border-bottom: 1px solid var(--line-strong);
+  white-space: nowrap; cursor: help; }}
+.perftable td {{ text-align: right; padding: 5px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }}
+.perftable th:first-child, .perftable td:first-child {{ text-align: left; }}
+.perftable td.date .wd {{ color: var(--ink-2); display: inline-block; width: 2.4em; }}
+.perftable td .none {{ color: var(--muted); }}
+.perftable .arrow {{ font-size: 9px; margin-right: 4px; vertical-align: 1px; }}
+.perftable .gain .arrow {{ color: var(--gain); }}
+.perftable .loss .arrow {{ color: var(--loss); }}
+.perftable tr:hover td {{ background: var(--surface-2); }}
+.perftable td.fee {{ position: relative; }}
+.perftable td.fee .amount {{ border-bottom: 1px dotted var(--ink-2); cursor: help; }}
+.perftable td.fee .tip {{ display: none; position: absolute; top: calc(100% + 2px); right: 0; z-index: 20;
+  min-width: 260px; padding: 9px 11px; border-radius: 8px; white-space: nowrap; text-align: left;
+  background: var(--surface-2); color: var(--ink); border: 1px solid var(--line-strong);
+  box-shadow: 0 6px 18px rgba(0,0,0,.25); font-size: 12px; line-height: 1.55; }}
+.perftable tr.up td.fee .tip {{ top: auto; bottom: calc(100% + 2px); }}
+.perftable td.fee:hover .tip {{ display: block; }}
+/* The table sits in an expander, which clips what overflows it; let the
+   fee panel of a short (filtered) table show in full. */
+[data-testid="stExpander"]:has(.perftable) details,
+[data-testid="stExpander"]:has(.perftable) [data-testid="stExpanderDetails"] {{ overflow: visible; }}
+.perftable .tip b {{ font-weight: 650; }}
+.perftable .tip .row {{ display: flex; justify-content: space-between; gap: 18px; }}
+.perftable .tip .row span:first-child {{ color: var(--ink-2); }}
+.perftable .tip .hint {{ color: var(--ink-2); font-size: 11.5px; margin-top: 4px; white-space: normal; }}
 </style>
 """
 
@@ -640,3 +671,71 @@ def month_row_html(*, month: dict, scale: tuple[float, float], dark: bool) -> st
         f'<div class="name">{_calendar.month_name[month["month"]]} {month["year"]}</div>'
         f'{_spark(month=month, scale=scale, dark=dark)}{totals}{fees}</div></div>'
     ))
+
+
+# ---- daily table ------------------------------------------------------------
+
+# Header and hover help per column of the daily table, in order.
+TABLE_COLUMNS = (
+    ("Date", "The trading day. Monday is measured from Friday."),
+    ("Account value", "Cash plus holdings at the day's close."),
+    ("P&L", "Gain or loss since the previous close, deposits and withdrawals taken out."),
+    ("Return", "P&L as a percent of the previous close plus the day's deposit."),
+    ("Deposits", "Money added (+) or taken out (−) that day."),
+    ("Fees", "Commissions and broker fees that day, already inside the P&L. Hover one to see what it was for."),
+)
+# The last rows open the fee panel upward, so it stays inside the table.
+TABLE_UP_ROWS = 3
+
+
+def _fee_tip(*, row: dict, currency: str | None) -> str:
+    unit = f" {currency}" if currency else ""
+    lines = [f"<b>Fees on {fmt_date(date=row['date'])}</b>"]
+    lines.extend(_tip_row(label=what, value=f"{cost:,.2f}{unit}") for what, cost in row["fee_details"])
+    if len(row["fee_details"]) > 1:
+        lines.append(_tip_row(label="Total", value=f"{row['fees']:,.2f}{unit}"))
+    if any(what.endswith("(currency conversion)") for what, _cost in row["fee_details"]):
+        lines.append('<div class="hint">A currency conversion has its own fee, set in the '
+                     "other currency, so its amount here moves with the exchange rate.</div>")
+    return f'<div class="tip">{"".join(lines)}</div>'
+
+
+def _table_row(*, row: dict, currency: str | None, up: bool) -> str:
+    none = '<span class="none">—</span>'
+    date = row["date"]
+    cells = [f'<td class="date"><span class="wd">{_calendar.day_abbr[date.weekday()]}</span>'
+             f"{fmt_date(date=date)}</td>",
+             f"<td>{row['nav']:,.2f}</td>"]
+    if row["state"] is None:
+        cells += [f"<td>{none}</td>", f"<td>{none}</td>"]
+    else:
+        cells += [f"<td>{html.escape(fmt_money(value=row['pnl']))}</td>",
+                  f'<td class="{row["state"]}">{_arrow(state=row["state"])}'
+                  f"{html.escape(fmt_pct(ret=row['ret']))}</td>"]
+    flow = row["flow"]
+    cells.append(f"<td>{html.escape(fmt_money(value=flow))}</td>"
+                 if abs(flow) >= performance.FLAT_EPSILON else "<td></td>")
+    if abs(row["fees"]) >= performance.FLAT_EPSILON:
+        cells.append(f'<td class="fee"><span class="amount">{row["fees"]:,.2f}</span>'
+                     f"{_fee_tip(row=row, currency=currency)}</td>")
+    else:
+        cells.append("<td></td>")
+    opening = '<tr class="up">' if up else "<tr>"
+    return f'{opening}{"".join(cells)}</tr>'
+
+
+def daily_table_html(*, rows: list[dict], currency: str | None, dark: bool) -> str:
+    """The daily table, rows as ``performance.table_rows`` gives them. Money
+    headers carry the currency; each header's help shows on hover."""
+    unit = f" ({currency})" if currency else ""
+    money = {"Account value", "P&L", "Deposits", "Fees"}
+    head = "".join(
+        f'<th title="{html.escape(help_text)}">{html.escape(name)}{unit if name in money else ""}</th>'
+        for name, help_text in TABLE_COLUMNS
+    )
+    body = "".join(
+        _table_row(row=row, currency=currency, up=index >= len(rows) - TABLE_UP_ROWS and index >= TABLE_UP_ROWS)
+        for index, row in enumerate(rows)
+    )
+    return _root(dark=dark, body=f'<table class="perftable"><thead><tr>{head}</tr></thead>'
+                                 f"<tbody>{body}</tbody></table>")

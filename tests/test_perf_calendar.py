@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import datetime as dt
+import html
 import re
 
 import pandas as pd
@@ -504,3 +505,58 @@ def test_text_keeps_aa_contrast_on_every_tint_step(theme, kind):
 def test_tint_steps_get_stronger(theme):
     alphas = perf_calendar.TINT_ALPHA[theme]
     assert list(alphas) == sorted(alphas) and len(set(alphas)) == 4
+
+
+# ---- daily table --------------------------------------------------------------
+
+def _table_row(*, date, pnl, ret, flow, fees, details):
+    return {"date": date, "nav": 2639.68, "pnl": pnl, "ret": ret, "flow": flow, "fees": fees,
+            "fee_details": details, "state": None if pnl is None else performance.state(pnl=pnl)}
+
+
+def test_daily_table_fee_cell_has_a_panel_saying_what_the_fee_was_for():
+    row = _table_row(date=D(2026, 5, 12), pnl=-18.68, ret=-0.007, flow=0.0, fees=3.4449,
+                     details=[("Buy 64 USD.ILS (currency conversion)", 3.4449)])
+    out = perf_calendar.daily_table_html(rows=[row], currency="USD", dark=False)
+    assert '<td class="fee"><span class="amount">3.44</span><div class="tip">' in out
+    assert "Fees on 12-05-2026" in out
+    assert "Buy 64 USD.ILS (currency conversion)" in out and "3.44 USD" in out
+    assert "moves with the exchange rate" in out
+    assert "Total" not in out                     # one charge: no total line
+    assert "Tue</span>12-05-2026" in out
+    assert "−18.68" in out and "−0.70%" in out and 'class="loss"' in out
+
+
+def test_daily_table_several_fees_get_a_total_and_text_is_escaped():
+    row = _table_row(date=D(2026, 7, 6), pnl=4.0, ret=0.001, flow=0.0, fees=5.0,
+                     details=[("Buy 1 A<B", 2.5), ("Buy 2 KO", 2.5)])
+    out = perf_calendar.daily_table_html(rows=[row], currency="USD", dark=False)
+    assert "A&lt;B" in out and "A<B" not in out
+    assert "<span>Total</span><span>5.00 USD</span>" in out
+    assert "exchange rate" not in out
+
+
+def test_daily_table_empty_cells_and_first_day_dashes():
+    first = _table_row(date=D(2026, 3, 2), pnl=None, ret=None, flow=0.0, fees=0.0, details=[])
+    deposit = _table_row(date=D(2026, 3, 3), pnl=10.0, ret=0.0067, flow=500.0, fees=0.0, details=[])
+    out = perf_calendar.daily_table_html(rows=[deposit, first], currency=None, dark=True)
+    assert "perfcal-root dark" in out
+    assert "+500.00" in out
+    assert 'class="fee"' not in out               # no fee: no panel
+    assert out.count('<span class="none">—</span>') == 2
+    assert "<th" in out and "(None)" not in out   # no currency: plain headers
+
+
+def test_daily_table_last_rows_open_the_fee_panel_upward():
+    rows = [_table_row(date=D(2026, 3, day), pnl=1.0, ret=0.001, flow=0.0, fees=2.5,
+                       details=[("Buy 1 KO", 2.5)]) for day in range(2, 12)]
+    out = perf_calendar.daily_table_html(rows=rows, currency="USD", dark=False)
+    assert out.count('<tr class="up">') == perf_calendar.TABLE_UP_ROWS
+    assert out.rindex("<tr>") < out.index('<tr class="up">')
+
+
+def test_daily_table_headers_carry_help_and_currency():
+    out = perf_calendar.daily_table_html(rows=[], currency="USD", dark=False)
+    for name, help_text in perf_calendar.TABLE_COLUMNS:
+        assert html.escape(help_text) in out
+    assert "P&amp;L (USD)" in out and "Return</th>" in out
