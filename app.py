@@ -2331,19 +2331,63 @@ def _perf_metrics(
     )
 
 
+_PERF_TABLE_INFO = (
+    "One row per trading day, newest first. Each row compares the account at that "
+    "day's close with the close before it.\n"
+    "- **Account value**: cash plus holdings at the day's close.\n"
+    "- **P&L**: what the account gained or lost that day, with deposits and "
+    "withdrawals taken out, so adding money is not a gain.\n"
+    "- **Return**: the P&L as a percent of the previous close plus that day's deposit.\n"
+    "- **Deposits**: money added (+) or taken out (−) that day.\n"
+    "- **Fees**: commissions and broker fees charged that day. They are already "
+    "inside the P&L.\n"
+    "\nAn empty cell means none that day. The first day has no close before it, so "
+    "its P&L and Return are empty."
+)
+
+
 def _perf_table(
     *, daily: pd.DataFrame, fees: dict[dt.date, float], start: dt.date, end: dt.date,
 ) -> pd.DataFrame:
-    """The period's days as a plain table: the same numbers as the calendar."""
-    rows = daily[(daily["date"] >= start) & (daily["date"] <= end)]
+    """The period's days as a plain table, newest first: the same numbers as the
+    calendar. Deposits and fees are None (an empty cell) on days without one."""
+    rows = daily[(daily["date"] >= start) & (daily["date"] <= end)].iloc[::-1]
+
+    def blank_zero(value: float) -> float | None:
+        return round(value, 2) if abs(value) >= performance.FLAT_EPSILON else None
+
     return pd.DataFrame({
-        "Date": [perf_calendar.fmt_date(date=d) for d in rows["date"]],
-        "Close": rows["nav"].round(2).to_list(),
-        "Change": pd.to_numeric(rows["pnl"]).round(2).to_list(),
-        "Return %": (pd.to_numeric(rows["ret"]) * 100).round(2).to_list(),
-        "Deposit / withdrawal": rows["flow"].round(2).to_list(),
-        "Fees": [round(fees.get(d, 0.0), 2) for d in rows["date"]],
+        "Date": pd.to_datetime(rows["date"]).to_list(),
+        "Account value": rows["nav"].round(2).to_list(),
+        "P&L": pd.to_numeric(rows["pnl"]).round(2).to_list(),
+        "Return": (pd.to_numeric(rows["ret"]) * 100).round(2).to_list(),
+        "Deposits": [blank_zero(float(flow)) for flow in rows["flow"]],
+        "Fees": [blank_zero(fees.get(d, 0.0)) for d in rows["date"]],
     })
+
+
+def _perf_table_config(*, currency: str | None) -> dict:
+    """Column formats and hover help for ``_perf_table``. The currency goes in
+    the money headers."""
+    unit = f" ({currency})" if currency else ""
+    return {
+        "Date": st.column_config.DateColumn(
+            "Date", format="ddd DD-MM-YYYY", help="The trading day. Monday is measured from Friday."),
+        "Account value": st.column_config.NumberColumn(
+            f"Account value{unit}", format="%.2f", help="Cash plus holdings at the day's close."),
+        "P&L": st.column_config.NumberColumn(
+            f"P&L{unit}", format="%+.2f",
+            help="Gain or loss since the previous close, deposits and withdrawals taken out."),
+        "Return": st.column_config.NumberColumn(
+            "Return", format="%+.2f%%",
+            help="P&L as a percent of the previous close plus the day's deposit."),
+        "Deposits": st.column_config.NumberColumn(
+            f"Deposits{unit}", format="%+.2f",
+            help="Money added (+) or taken out (−) that day. Empty: none."),
+        "Fees": st.column_config.NumberColumn(
+            f"Fees{unit}", format="%.2f",
+            help="Commissions and broker fees that day, already inside the P&L. Empty: none."),
+    }
 
 
 def tab_performance(*, data: dict) -> None:
@@ -2491,7 +2535,9 @@ def tab_performance(*, data: dict) -> None:
             "that month."
         )
     with st.expander("Daily table"):
+        st.markdown(_PERF_TABLE_INFO)
         st.dataframe(_perf_table(daily=daily, fees=fees, start=start, end=end),
+                     column_config=_perf_table_config(currency=currency),
                      width="stretch", hide_index=True)
 
 

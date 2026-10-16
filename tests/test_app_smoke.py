@@ -719,6 +719,42 @@ def test_perf_fee_text_names_each_kind_that_charged():
     assert "Other" not in help_text
 
 
+def test_perf_table_is_newest_first_with_empty_cells_for_no_deposit_or_fee():
+    import app
+
+    D = dt.date
+    daily = pd.DataFrame([
+        {"date": D(2026, 3, 2), "nav": 1000.0, "prev_date": None, "prev_nav": None,
+         "flow": 0.0, "pnl": None, "ret": None},
+        {"date": D(2026, 3, 3), "nav": 1510.0, "prev_date": D(2026, 3, 2), "prev_nav": 1000.0,
+         "flow": 500.0, "pnl": 10.0, "ret": 10.0 / 1500.0},
+        {"date": D(2026, 3, 4), "nav": 1495.0, "prev_date": D(2026, 3, 3), "prev_nav": 1510.0,
+         "flow": 0.0, "pnl": -15.0, "ret": -15.0 / 1510.0},
+    ])
+    table = app._perf_table(daily=daily, fees={D(2026, 3, 4): 2.5},
+                            start=D(2026, 3, 1), end=D(2026, 3, 31))
+    assert list(table.columns) == ["Date", "Account value", "P&L", "Return", "Deposits", "Fees"]
+    assert [d.date() for d in table["Date"]] == [D(2026, 3, 4), D(2026, 3, 3), D(2026, 3, 2)]
+    assert table["P&L"].iloc[0] == -15.0
+    assert table["Return"].iloc[1] == pytest.approx(0.67)
+    # No deposit or fee that day: an empty cell, not 0.00.
+    assert pd.isna(table["Deposits"].iloc[0]) and table["Deposits"].iloc[1] == 500.0
+    assert pd.isna(table["Deposits"].iloc[2])
+    assert table["Fees"].iloc[0] == 2.5 and pd.isna(table["Fees"].iloc[1])
+    # The first day has no close before it: no result.
+    assert pd.isna(table["P&L"].iloc[2]) and pd.isna(table["Return"].iloc[2])
+
+
+def test_perf_table_config_covers_every_column_with_help_and_currency():
+    import app
+
+    config = app._perf_table_config(currency="USD")
+    assert set(config) == {"Date", "Account value", "P&L", "Return", "Deposits", "Fees"}
+    assert all(column["help"] for column in config.values())
+    assert config["P&L"]["label"] == "P&L (USD)"
+    assert app._perf_table_config(currency=None)["P&L"]["label"] == "P&L"
+
+
 def test_perf_fee_text_without_fees_has_no_line():
     import app
 
