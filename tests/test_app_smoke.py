@@ -732,8 +732,11 @@ def test_perf_table_is_newest_first_with_empty_cells_for_no_deposit_or_fee():
          "flow": 0.0, "pnl": -15.0, "ret": -15.0 / 1510.0},
     ])
     table = app._perf_table(daily=daily, fees={D(2026, 3, 4): 2.5},
+                            fee_notes={D(2026, 3, 4): "2.50: Buy 10 KO"},
                             start=D(2026, 3, 1), end=D(2026, 3, 31))
-    assert list(table.columns) == ["Date", "Account value", "P&L", "Return", "Deposits", "Fees"]
+    assert list(table.columns) == ["Date", "Account value", "P&L", "Return", "Deposits", "Fees",
+                                   "Fee for"]
+    assert table["Fee for"].to_list() == ["2.50: Buy 10 KO", None, None]
     assert [d.date() for d in table["Date"]] == [D(2026, 3, 4), D(2026, 3, 3), D(2026, 3, 2)]
     assert table["P&L"].iloc[0] == -15.0
     assert table["Return"].iloc[1] == pytest.approx(0.67)
@@ -749,7 +752,7 @@ def test_perf_table_config_covers_every_column_with_help_and_currency():
     import app
 
     config = app._perf_table_config(currency="USD")
-    assert set(config) == {"Date", "Account value", "P&L", "Return", "Deposits", "Fees"}
+    assert set(config) == {"Date", "Account value", "P&L", "Return", "Deposits", "Fees", "Fee for"}
     assert all(column["help"] for column in config.values())
     assert config["P&L"]["label"] == "P&L (USD)"
     assert app._perf_table_config(currency=None)["P&L"]["label"] == "P&L"

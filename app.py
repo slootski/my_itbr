@@ -2341,13 +2341,16 @@ _PERF_TABLE_INFO = (
     "- **Deposits**: money added (+) or taken out (−) that day.\n"
     "- **Fees**: commissions and broker fees charged that day. They are already "
     "inside the P&L.\n"
+    "- **Fee for**: what each fee was charged for: the trade (a currency conversion "
+    "such as USD.ILS has its own fee) or the broker fee.\n"
     "\nAn empty cell means none that day. The first day has no close before it, so "
     "its P&L and Return are empty."
 )
 
 
 def _perf_table(
-    *, daily: pd.DataFrame, fees: dict[dt.date, float], start: dt.date, end: dt.date,
+    *, daily: pd.DataFrame, fees: dict[dt.date, float], fee_notes: dict[dt.date, str],
+    start: dt.date, end: dt.date,
 ) -> pd.DataFrame:
     """The period's days as a plain table, newest first: the same numbers as the
     calendar. Deposits and fees are None (an empty cell) on days without one."""
@@ -2363,6 +2366,7 @@ def _perf_table(
         "Return": (pd.to_numeric(rows["ret"]) * 100).round(2).to_list(),
         "Deposits": [blank_zero(float(flow)) for flow in rows["flow"]],
         "Fees": [blank_zero(fees.get(d, 0.0)) for d in rows["date"]],
+        "Fee for": [fee_notes.get(d) for d in rows["date"]],
     })
 
 
@@ -2387,6 +2391,8 @@ def _perf_table_config(*, currency: str | None) -> dict:
         "Fees": st.column_config.NumberColumn(
             f"Fees{unit}", format="%.2f",
             help="Commissions and broker fees that day, already inside the P&L. Empty: none."),
+        "Fee for": st.column_config.TextColumn(
+            "Fee for", help="What each fee was charged for: the trade or the broker fee."),
     }
 
 
@@ -2536,7 +2542,10 @@ def tab_performance(*, data: dict) -> None:
         )
     with st.expander("Daily table"):
         st.markdown(_PERF_TABLE_INFO)
-        st.dataframe(_perf_table(daily=daily, fees=fees, start=start, end=end),
+        st.dataframe(_perf_table(daily=daily, fees=fees,
+                                 fee_notes=performance.fee_notes(trades=data.get("trades"),
+                                                                 cash_tx=data.get("cash_tx")),
+                                 start=start, end=end),
                      column_config=_perf_table_config(currency=currency),
                      width="stretch", hide_index=True)
 

@@ -395,6 +395,32 @@ def test_fees_split_without_asset_class_counts_as_trades():
     assert out[performance.FEE_FX]["count"] == 0
 
 
+def test_fee_notes_say_what_each_fee_was_for():
+    trades = pd.DataFrame([
+        {"trade_date": D(2026, 5, 12), "asset_class": "CASH", "symbol": "USD.ILS", "side": "BUY",
+         "quantity": 64.0, "commission": -3.4449},
+        {"trade_date": D(2026, 5, 13), "asset_class": "STK", "symbol": "KO", "side": "BUY",
+         "quantity": 10.0, "commission": -2.5},
+        {"trade_date": D(2026, 5, 13), "asset_class": "STK", "symbol": "PFE", "side": "SELL",
+         "quantity": -5.0, "commission": -2.5},
+        {"trade_date": D(2026, 5, 14), "asset_class": "STK", "symbol": "XOM", "side": "BUY",
+         "quantity": 1.0, "commission": 0.0},   # free: no note
+    ])
+    cash_tx = pd.DataFrame([
+        {"type": "FEES", "symbol": "", "amount_base": -1.5, "report_date": D(2026, 5, 15)},
+    ])
+    out = performance.fee_notes(trades=trades, cash_tx=cash_tx)
+    assert out == {
+        D(2026, 5, 12): "3.44: Buy 64 USD.ILS (currency conversion)",
+        D(2026, 5, 13): "2.50: Buy 10 KO; 2.50: Sell 5 PFE",
+        D(2026, 5, 15): "1.50: broker fee",
+    }
+
+
+def test_fee_notes_empty_input():
+    assert performance.fee_notes(trades=None, cash_tx=None) == {}
+
+
 def test_fees_split_empty_input():
     out = performance.fees_split(trades=None, cash_tx=None, start=D(2026, 3, 1), end=D(2026, 3, 31))
     assert out == {kind: {"amount": 0.0, "count": 0} for kind in performance.FEE_KINDS}
