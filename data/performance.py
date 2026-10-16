@@ -53,6 +53,12 @@ _FLOW_DATE_COLS = ("report_date", "datetime", "settle_date")
 # type with the opposite sign). Trade commissions come from the trades instead.
 FEE_TYPES = frozenset({"FEES", "COMMADJ", "ADVISORFEES"})
 
+# Fee kinds the Fees card splits the total into, in display order. IBKR files
+# currency conversions (e.g. USD.ILS) under asset class CASH.
+FEE_TRADE, FEE_FX, FEE_OTHER = "trades", "fx", "other"
+FEE_KINDS = (FEE_TRADE, FEE_FX, FEE_OTHER)
+FX_ASSET_CLASS = "CASH"
+
 # A result smaller than half a cent rounds to 0.00 on screen: that day is flat.
 FLAT_EPSILON = 0.005
 
@@ -262,6 +268,33 @@ def months(*, daily: pd.DataFrame) -> list[tuple[int, int]]:
     return sorted(seen, reverse=True)
 
 
+def _fee_items(
+    *, trades: pd.DataFrame | None, cash_tx: pd.DataFrame | None,
+) -> list[tuple[dt.date, str, float]]:
+    """Every charge as ``(date, kind, cost)``, cost positive. ``kind`` is
+    ``FEE_TRADE`` for a commission on a security trade, ``FEE_FX`` for one on
+    a currency conversion (IBKR files those under asset class ``CASH``) and
+    ``FEE_OTHER`` for a fee-type cash transaction."""
+    out: list[tuple[dt.date, str, float]] = []
+    if trades is not None and not trades.empty and "commission" in trades:
+        for row in trades.to_dict("records"):
+            date = _to_date(value=row.get("trade_date")) or _to_date(value=row.get("datetime"))
+            commission = _num(value=row.get("commission"))
+            if date is not None and commission:
+                kind = FEE_FX if row.get("asset_class") == FX_ASSET_CLASS else FEE_TRADE
+                out.append((date, kind, -commission))
+    if cash_tx is not None and not cash_tx.empty and "type" in cash_tx:
+        for row in cash_tx[cash_tx["type"].astype(str).isin(FEE_TYPES)].to_dict("records"):
+            amount = _num(value=row.get("amount_base"))
+            date = next(
+                (d for d in (_to_date(value=row.get(col)) for col in _FLOW_DATE_COLS) if d is not None),
+                None,
+            )
+            if date is not None and amount:
+                out.append((date, FEE_OTHER, -amount))
+    return out
+
+
 def fees_by_day(
     *, trades: pd.DataFrame | None, cash_tx: pd.DataFrame | None,
 ) -> dict[dt.date, float]:
@@ -274,21 +307,22 @@ def fees_by_day(
     archive does not store, and for this account it is always the base currency.
     """
     out: dict[dt.date, float] = {}
-    if trades is not None and not trades.empty and "commission" in trades:
-        for row in trades.to_dict("records"):
-            date = _to_date(value=row.get("trade_date")) or _to_date(value=row.get("datetime"))
-            commission = _num(value=row.get("commission"))
-            if date is not None and commission:
-                out[date] = out.get(date, 0.0) - commission
-    if cash_tx is not None and not cash_tx.empty and "type" in cash_tx:
-        for row in cash_tx[cash_tx["type"].astype(str).isin(FEE_TYPES)].to_dict("records"):
-            amount = _num(value=row.get("amount_base"))
-            date = next(
-                (d for d in (_to_date(value=row.get(col)) for col in _FLOW_DATE_COLS) if d is not None),
-                None,
-            )
-            if date is not None and amount:
-                out[date] = out.get(date, 0.0) - amount
+    for date, _kind, cost in _fee_items(trades=trades, cash_tx=cash_tx):
+        out[date] = out.get(date, 0.0) + cost
+    return out
+
+
+def fees_split(
+    *, trades: pd.DataFrame | None, cash_tx: pd.DataFrame | None, start: dt.date, end: dt.date,
+) -> dict[str, dict[str, float | int]]:
+    """Fees within ``start``..``end`` (both included) by kind: ``{kind:
+    {"amount": cost, "count": charges}}`` for each of ``FEE_KINDS``. The
+    amounts add up to ``fees_total`` over the same days."""
+    out: dict[str, dict[str, float | int]] = {kind: {"amount": 0.0, "count": 0} for kind in FEE_KINDS}
+    for date, kind, cost in _fee_items(trades=trades, cash_tx=cash_tx):
+        if start <= date <= end:
+            out[kind]["amount"] += cost
+            out[kind]["count"] += 1
     return out
 
 

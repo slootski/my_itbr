@@ -700,6 +700,32 @@ def test_performance_tab_with_one_month_shows_it_without_period_controls(smoke_a
     assert metrics["Up days"] == "1 / 1"
     # The statement's one trade (1 Jun 2024, commission 1.00) is outside December.
     assert metrics["Fees (USD)"] == "0.00"
+    # Nothing charged: no split line under the total.
+    assert next(m for m in at.metric if m.label == "Fees (USD)").delta in (None, "")
+
+
+def test_perf_fee_text_names_each_kind_that_charged():
+    import app
+
+    split = {
+        "trades": {"amount": 125.0, "count": 50},
+        "fx": {"amount": 31.69, "count": 10},
+        "other": {"amount": 0.0, "count": 0},
+    }
+    line, help_text = app._perf_fee_text(split=split)
+    assert line == "Trades 125.00 · FX 31.69"
+    assert "- Trades: 125.00 from 50 charges" in help_text
+    assert "- FX: 31.69 from 10 charges" in help_text
+    assert "Other" not in help_text
+
+
+def test_perf_fee_text_without_fees_has_no_line():
+    import app
+
+    split = {kind: {"amount": 0.0, "count": 0} for kind in ("trades", "fx", "other")}
+    line, help_text = app._perf_fee_text(split=split)
+    assert line is None
+    assert help_text.startswith("Trade commissions and broker fees")
 
 
 def test_performance_period_starts_on_everything(three_month_app):

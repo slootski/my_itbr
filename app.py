@@ -2275,7 +2275,35 @@ def _perf_day_text(*, day: dict | None) -> tuple[str, str | None]:
     return perf_calendar.fmt_pct(ret=day["ret"]), f"{perf_calendar.fmt_date(date=day['date'])}: {unit}"
 
 
-def _perf_metrics(*, summary: dict, fees: float, currency: str | None) -> None:
+_FEE_LABELS = {
+    performance.FEE_TRADE: ("Trades", "commission on a stock or fund order"),
+    performance.FEE_FX: ("FX", "commission on a currency conversion, e.g. USD.ILS"),
+    performance.FEE_OTHER: ("Other", "broker fee or commission adjustment"),
+}
+
+
+def _perf_fee_text(*, split: dict[str, dict[str, float | int]]) -> tuple[str | None, str]:
+    """(split line, help) for the Fees metric. The line names each kind that
+    charged something, e.g. ``Trades 125.00 · FX 31.69``."""
+    charged = [kind for kind in performance.FEE_KINDS if split[kind]["count"]]
+    line = " · ".join(
+        f"{_FEE_LABELS[kind][0]} {split[kind]['amount']:,.2f}" for kind in charged
+    ) or None
+    lines = [
+        f"- {_FEE_LABELS[kind][0]}: {split[kind]['amount']:,.2f} from {split[kind]['count']} "
+        f"charge{'s' if split[kind]['count'] != 1 else ''} ({_FEE_LABELS[kind][1]})"
+        for kind in charged
+    ]
+    help_text = ("Trade commissions and broker fees charged in the period. They are already "
+                 "inside the profit / loss, not on top of it.")
+    if lines:
+        help_text = f"{help_text}\n\n" + "\n".join(lines)
+    return line, help_text
+
+
+def _perf_metrics(
+    *, summary: dict, fees: float, fee_split: dict[str, dict[str, float | int]], currency: str | None,
+) -> None:
     cols = st.container(key=perf_calendar.METRICS_KEY).columns(6)
     cols[0].metric(
         "Return", perf_calendar.fmt_pct(ret=summary["ret"]), border=True,
@@ -2296,10 +2324,10 @@ def _perf_metrics(*, summary: dict, fees: float, currency: str | None) -> None:
         "Up days", f"{summary['up_days']} / {summary['days']}" if summary["days"] else "—",
         border=True, help="Days that closed with a gain, out of the days with a close.",
     )
+    fee_line, fee_help = _perf_fee_text(split=fee_split)
     cols[5].metric(
-        f"Fees ({currency})" if currency else "Fees", f"{fees:,.2f}", border=True,
-        help="Trade commissions and broker fees charged in the period. They are already "
-             "inside the profit / loss, not on top of it.",
+        f"Fees ({currency})" if currency else "Fees", f"{fees:,.2f}", delta=fee_line,
+        delta_color="off", delta_arrow="off", border=True, help=fee_help,
     )
 
 
@@ -2402,7 +2430,11 @@ def tab_performance(*, data: dict) -> None:
     st.markdown(f"**{title}**")
     _perf_metrics(
         summary=performance.summary(daily=daily, start=start, end=end),
-        fees=performance.fees_total(fees=fees, start=start, end=end), currency=currency,
+        fees=performance.fees_total(fees=fees, start=start, end=end),
+        fee_split=performance.fees_split(
+            trades=data.get("trades"), cash_tx=data.get("cash_tx"), start=start, end=end,
+        ),
+        currency=currency,
     )
     if len(chosen) == 1:
         year, month = chosen[0]

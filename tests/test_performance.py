@@ -352,6 +352,54 @@ def test_fees_total_counts_days_without_a_close():
     assert performance.fees_total(fees={}, start=D(2026, 3, 1), end=D(2026, 3, 31)) == 0
 
 
+def _fee_fixture():
+    trades = pd.DataFrame([
+        {"trade_date": D(2026, 3, 3), "asset_class": "STK", "commission": -2.5},
+        {"trade_date": D(2026, 3, 4), "asset_class": "STK", "commission": -2.5},
+        # A currency conversion: a flat 10 ILS shown in USD at the day's rate.
+        {"trade_date": D(2026, 3, 5), "asset_class": "CASH", "commission": -3.0512},
+        {"trade_date": D(2026, 3, 6), "asset_class": "CASH", "commission": 0.0},   # free: not counted
+        {"trade_date": D(2026, 4, 1), "asset_class": "STK", "commission": -2.5},   # next month
+    ])
+    cash_tx = pd.DataFrame([
+        {"type": "FEES", "amount_base": -1.5, "report_date": D(2026, 3, 9)},
+        {"type": "WHTAX", "amount_base": -6.0, "report_date": D(2026, 3, 9)},
+    ])
+    return trades, cash_tx
+
+
+def test_fees_split_separates_trades_currency_conversions_and_other_fees():
+    trades, cash_tx = _fee_fixture()
+    out = performance.fees_split(trades=trades, cash_tx=cash_tx, start=D(2026, 3, 1), end=D(2026, 3, 31))
+    assert out[performance.FEE_TRADE] == {"amount": pytest.approx(5.0), "count": 2}
+    assert out[performance.FEE_FX] == {"amount": pytest.approx(3.0512), "count": 1}
+    assert out[performance.FEE_OTHER] == {"amount": pytest.approx(1.5), "count": 1}
+
+
+def test_fees_split_adds_up_to_the_period_total():
+    trades, cash_tx = _fee_fixture()
+    start, end = D(2026, 3, 1), D(2026, 4, 30)
+    split = performance.fees_split(trades=trades, cash_tx=cash_tx, start=start, end=end)
+    total = performance.fees_total(
+        fees=performance.fees_by_day(trades=trades, cash_tx=cash_tx), start=start, end=end,
+    )
+    assert sum(kind["amount"] for kind in split.values()) == pytest.approx(total)
+    assert total == pytest.approx(5.0 + 2.5 + 3.0512 + 1.5)
+
+
+def test_fees_split_without_asset_class_counts_as_trades():
+    """Older rows without ``asset_class`` stay in Trades, as before the split."""
+    trades = pd.DataFrame([{"trade_date": D(2026, 3, 3), "commission": -1.0}])
+    out = performance.fees_split(trades=trades, cash_tx=None, start=D(2026, 3, 1), end=D(2026, 3, 31))
+    assert out[performance.FEE_TRADE] == {"amount": pytest.approx(1.0), "count": 1}
+    assert out[performance.FEE_FX]["count"] == 0
+
+
+def test_fees_split_empty_input():
+    out = performance.fees_split(trades=None, cash_tx=None, start=D(2026, 3, 1), end=D(2026, 3, 31))
+    assert out == {kind: {"amount": 0.0, "count": 0} for kind in performance.FEE_KINDS}
+
+
 def test_cell_carries_the_days_fees(daily):
     details = {D(2026, 3, 3): {"dividends": 0.0, "fees": 1.35, "bought": 2, "sold": 0}}
     weeks = performance.month_weeks(daily=daily, details=details, year=2026, month=3, today=TODAY)
